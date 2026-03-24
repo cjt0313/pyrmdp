@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: pyrmdp
+Version: 0.1.0
+Summary: Relational MDPs with First-Order Decision Diagrams
+Author: Jim
+Requires-Dist: z3-solver
+Requires-Dist: networkx
+Requires-Dist: pyvis
+Dynamic: author
+Dynamic: requires-dist
+Dynamic: summary
