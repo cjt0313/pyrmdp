@@ -1,143 +1,237 @@
-# pyrmdp: Relational MDPs with First-Order Decision Diagrams (FODDs)
+# pyrmdp — Lifted FODDs + Domain Robustification Pipeline
 
-`pyrmdp` is a Python library designed to efficiently represent and solve **Relational Markov Decision Processes (RMDPs)** using **First-Order Decision Diagrams (FODDs)**. 
-Unlike traditional MDP solvers that require **grounding** (enumerating all possible states, resulting in exponential state space explosion), `pyrmdp` works directly with the **lifted** (relational) representation found in PPDDL files. It uses logical reductions and automated reasoning to prune the state space, keeping the representation compact.
+`pyrmdp` is a Python library for **Relational Markov Decision Processes (RMDPs)** built on **First-Order Decision Diagrams (FODDs)**. It works directly with the **lifted** (relational) representation — no exponential grounding required.
+
+On top of the FODD core, pyrmdp ships a **synthesis pipeline** that takes a deterministic PDDL domain, hallucinate failure modes via an LLM, extracts an abstract Markov chain, and synthesizes the minimum set of recovery operators to guarantee strong connectivity — emitting a multi-policy PPDDL with reward-annotated human/robot branches.
 
 ## Table of Contents
 
-- [1. Core Concept & Theory](#1-core-concept--theory)
-  - [1.1 Relational MDPs vs. Grounded MDPs](#11-relational-mdps-vs-grounded-mdps)
-  - [1.2 FODDs and State Space Reduction](#12-fodds-and-state-space-reduction)
-  - [1.3 The 5 Reduction Rules (R1-R5)](#13-the-5-reduction-rules-r1-r5)
-- [2. Architecture & Design](#2-architecture--design)
-  - [2.1 Project Structure](#21-project-structure)
-  - [2.2 Logic & PPDDL Parsing (`core.logic`)](#22-logic--ppddl-parsing-corelogic)
-  - [2.3 FODD Core & Manager (`core.fodd`)](#23-fodd-core--manager-corefodd)
-  - [2.4 Reduction Engine (`pruning.reduction`)](#24-reduction-engine-pruningreduction)
-  - [2.5 Automated Reasoning with LLMs & Z3 (`pruning.llm_axiom`)](#25-automated-reasoning-with-llms--z3-pruningllm_axiom)
-- [3. Usage & Examples](#3-usage--examples)
-  - [3.1 Installation](#31-installation)
-  - [3.2 Running the Scripts](#32-running-the-scripts)
-  - [3.3 Visualization](#33-visualization)
+- [1. Core: FODDs & Reductions](#1-core-fodds--reductions)
+  - [1.1 Relational MDPs](#11-relational-mdps)
+  - [1.2 FODD Reduction Rules (R1–R5)](#12-fodd-reduction-rules-r1r5)
+- [2. Synthesis Pipeline](#2-synthesis-pipeline)
+- [3. Architecture](#3-architecture)
+  - [3.1 Project Structure](#31-project-structure)
+  - [3.2 Core Modules](#32-core-modules)
+  - [3.3 Synthesis Modules](#33-synthesis-modules)
+- [4. Installation](#4-installation)
+- [5. Quick Start](#5-quick-start)
+  - [5.1 FODD Visualization](#51-fodd-visualization)
+  - [5.2 Running the Synthesis Pipeline](#52-running-the-synthesis-pipeline)
+- [6. References](#6-references)
 
 ---
 
-## 1. Core Concept & Theory
+## 1. Core: FODDs & Reductions
 
-### 1.1 Relational MDPs vs. Grounded MDPs
+### 1.1 Relational MDPs
 
-*   **Grounded MDPs (Classic):** States are distinct identifiers (s1, s2, ...). A problem with 10 blocks can have millions of states. Solvers struggle with the "Curse of Dimensionality."
-*   **Relational MDPs (RMDPs):** States are described by properties and relations (e.g., `on(BlockA, BlockB)`). Policies allow generalization (e.g., "If *any* block is Clear, pick it up").
+| | Grounded MDP | Relational MDP |
+|---|---|---|
+| **States** | Flat identifiers (s1, s2, …) | Logical predicates: `on(A, B)`, `clear(A)` |
+| **Scalability** | Exponential blowup | Compact lifted representation |
+| **Policies** | Per-state lookup table | Generalizable: "if *any* block is clear, pick it up" |
 
-### 1.2 FODDs and State Space Reduction
+A **First-Order Decision Diagram (FODD)** is a DAG analogous to a BDD but over first-order atoms. pyrmdp uses FODDs for symbolic dynamic programming — automatically discovering and merging states that share the same value.
 
-A **First-Order Decision Diagram (FODD)** is a data structure similar to a Binary Decision Diagram (BDD) but for First-Order Logic. It represents a value function or policy as a directed acyclic graph (DAG). 
+### 1.2 FODD Reduction Rules (R1–R5)
 
-`pyrmdp` implements techniques from the **RelationalMDPADD** paper to perform **symbolic dynamic programming**. It computes the standard **Value Function** (satisfying the Bellman equation), but instead of a tabular representation, it **automatically** discovers and groups states that share the same value, representing the function compactly using logical decision diagrams.
-
-### 1.3 The 5 Reduction Rules (R1-R5)
-
-To prevent the FODD graph from exploding in size, `pyrmdp` applies five reduction operators:
-
-1.  **R1 (Neglect):** If the `True` branch and `False` branch of a node point to the same child, the node offers no information. **Delete it.**
-2.  **R2 (Join):** If two nodes represent the exact same logic (same test, same children), they are identical. **Merge them.** (Implemented via the `Unique Table` in `FODDManager`).
-3.  **R3 (Merge):** If a child node tests the same predicate as its parent, it is redundant. **Simplify the path.**
-4.  **R4 (Sort):** Enforces a strict Global Order on predicates (e.g., `on` must always be tested before `clear`). This ensures a canonical graph structure, making R2 efficient.
-5.  **R5 (Strong Reduction):** Uses background knowledge to prune impossible paths. 
-    *   *Example:* If we test `on(A, B) = True`, we know `clear(B)` must be `False`. A branch testing `clear(B) = True` after `on(A, B)` is **impossible (UNSAT)** and can be pruned.
-    *   `pyrmdp` uses **Z3 Theorem Prover** to verify these logical consistencies.
+| Rule | Name | Description |
+|------|------|-------------|
+| **R1** | Neglect | High and low branches point to the same child → delete the node |
+| **R2** | Join | Two nodes have identical test + children → merge (via unique table) |
+| **R3** | Merge | Child re-tests a parent's predicate → follow the known branch |
+| **R4** | Sort | Global predicate ordering ensures canonical structure |
+| **R5** | Strong | Background knowledge (Z3) prunes UNSAT branches |
 
 ---
 
-## 2. Architecture & Design
+## 2. Synthesis Pipeline
 
-### 2.1 Project Structure
+The `pyrmdp.synthesis` subpackage implements a 6-step pipeline for **Domain Robustification & Symbolic Skill Synthesis**:
+
+```
+PDDL Domain ──► Step 1 ──► Step 2 ──► Step 3 ──► Step 4 ──► Step 5 ──► Step 6 ──► PPDDL
+                 LLM        FODDs      SCC        MSCA       Delta       Multi-
+                Failure     Abstract   Condens.   Bound      Minim.     Policy
+                Halluc.     States                                      Emission
+```
+
+| Step | Module | What it does |
+|------|--------|-------------|
+| **1** | `llm_failure.py` | For each operator, query an LLM to hallucinate a plausible failure mode. Injects new predicates/types and failure effect branches into the domain. |
+| **2** | `fodd_builder.py` | Bridge pyPPDDL `ActionSchema` objects → pyrmdp `FODDManager`. Compile precondition trees into FODDs, encode probabilistic effects as leaves, compose via `apply(max)`, enumerate leaf-paths as abstract state partitions → `nx.DiGraph`. |
+| **3** | `graph_analysis.py` | Extract SCCs with `nx.condensation()` → DAG. Each DAG node is a set of abstract states that can already reach each other. |
+| **4** | `graph_analysis.py` | Identify sources (in-deg = 0) and sinks (out-deg = 0). Compute the MSCA bound: min new edges = max(\|sources\|, \|sinks\|). |
+| **5** | `delta_minimizer.py` | Iteratively pick the best sink→source pair (weighted scoring: α·(1−Δ) + β·gain), ask the LLM to synthesize a bridging operator + failure mode, add the edge, re-condense, repeat until irreducible. |
+| **6** | `ppddl_emitter.py` | For every operator, emit K robot-policy variants (3 probabilistic branches: success/unchanged/worse with reward annotations) + 1 human-policy variant (deterministic, reward 0). |
+
+**Dependency:** The pipeline uses [pyPPDDL](../POMDPDDL/pyPPDDL) for parsing and grounding PDDL/PPDDL domains. pyrmdp's own regex parser (`core.logic`) is retained for lightweight standalone usage.
+
+---
+
+## 3. Architecture
+
+### 3.1 Project Structure
 
 ```
 pyrmdp/
 ├── pyrmdp/
-│   ├── core/              # Core data structures
-│   │   ├── logic.py       # Atoms, Variables, PPDDL Parsing
-│   │   └── fodd.py        # FODDNode, FODDManager (R2, R4)
-│   ├── pruning/           # Reduction algorithms
-│   │   ├── reduction.py   # Syntactic (R1, R3) & Strong (R5) Reducers
-│   │   └── llm_axiom.py   # LLM generation of Z3 background knowledge
-│   └── vis/               # Visualization tools
-│       └── visualization.py # NetworkX/PyVis interactive plotting
-├── scripts/               # Example usage scripts
-└── setup.py               # Installation script
+│   ├── __init__.py            # Public API façade
+│   ├── core/
+│   │   ├── logic.py           # Atom, Variable, Constant, PPDDL regex parser
+│   │   ├── fodd.py            # FODDNode, FODDManager (unique table, global order)
+│   │   └── markov.py          # AbstractTransitionMatrix, spectral gap,
+│   │                          #   is_irreducible(), is_ergodic(),
+│   │                          #   get_communicating_classes()
+│   ├── pruning/
+│   │   ├── reduction.py       # SyntacticReducer (R1, R3), apply(), StrongReducer (R5)
+│   │   └── llm_axiom.py       # LLM → Z3 background knowledge generation
+│   ├── synthesis/             # ← NEW: 6-step robustification pipeline
+│   │   ├── __init__.py
+│   │   ├── llm_failure.py     # Step 1 — LLM failure hallucination
+│   │   ├── fodd_builder.py    # Step 2 — lifted FODD construction + abstract states
+│   │   ├── graph_analysis.py  # Steps 3 & 4 — SCC condensation + MSCA bound
+│   │   ├── delta_minimizer.py # Step 5 — iterative delta minimization
+│   │   └── ppddl_emitter.py   # Step 6 — multi-policy PPDDL emission
+│   └── vis/
+│       └── visualization.py   # pyvis interactive FODD/graph plotting
+├── scripts/
+│   ├── generate_add.py        # Build & visualize an FODD from PPDDL
+│   ├── generate_markov.py     # Build & visualize abstract Markov chain
+│   └── test_pipeline.py       # End-to-end pipeline test (mock LLM, no API key)
+└── setup.py
 ```
 
-### 2.2 Logic & PPDDL Parsing (`core.logic`)
+### 3.2 Core Modules
 
-*   **Classes:** `Variable`, `Constant`, `Atom`.
-*   **PPDDL Parsing:** Includes a regex-based parser (`parse_ppddl_predicates`) to extract schema information directly from `.ppddl` domain files.
+| Module | Key Classes / Functions |
+|--------|----------------------|
+| `core.logic` | `Variable`, `Constant`, `Atom`, `parse_ppddl_predicates()`, `parse_ppddl_actions()` |
+| `core.fodd` | `FODDNode`, `FODDManager` (unique table, global order, `get_node()`, `get_leaf()`) |
+| `core.markov` | `AbstractTransitionMatrix` — `build()`, `spectral_gap()`, `is_irreducible()`, `is_ergodic()`, `get_communicating_classes()` |
+| `pruning.reduction` | `SyntacticReducer` (R1 + R3 with path-aware memoization), `apply(op, mgr, f1, f2)`, `StrongReducer` (Z3) |
+| `pruning.llm_axiom` | `generate_background_knowledge(predicates)` → Z3 axiom strings |
+| `vis.visualization` | `plot_fodd_structure(manager, root)` → interactive HTML |
 
-### 2.3 FODD Core & Manager (`core.fodd`)
+### 3.3 Synthesis Modules
 
-*   **FODDManager:** The central "brain" of the system.
-    *   **Unique Table:** Implements **R2**. Ensures that if you request a node that already exists, you get the existing ID instead of creating a duplicate.
-    *   **Global Order:** Implements **R4**. Maintains the priority list of predicates to keep the graph sorted.
-
-### 2.4 Reduction Engine (`pruning.reduction`)
-
-*   **SyntacticReducer:** Handles local graph simplifications (R1 and R3) that don't require external solvers.
-*   **StrongReducer:** Interfaces with the **Z3 Solver**. It builds a logical path constraint for every branch. If `Constraint(path) AND BackgroundKnowledge` is unsatisfiable, the branch is pruned.
-
-### 2.5 Automated Reasoning with LLMs & Z3 (`pruning.llm_axiom`)
-
-A unique feature of `pyrmdp` is the ability to **automatically generate background knowledge**.
-1.  The system reads predicates from your PPDDL file.
-2.  It prompts an LLM (OpenAI/Azure) to intuit physical constraints (e.g., "An object cannot be at two places at once").
-3.  These constraints are converted into **Z3 Axioms** used by the `StrongReducer`.
+| Module | Key Classes / Functions |
+|--------|----------------------|
+| `synthesis.llm_failure` | `hallucinate_failures(domain, llm_fn=, failure_prob=)` → `(Domain, List[FailureHallucinationResult])` |
+| `synthesis.fodd_builder` | `map_pyppddl_to_pyrmdp()`, `build_precondition_fodd()`, `build_effect_fodd()`, `build_transition_fodd()`, `enumerate_abstract_states()` → `nx.DiGraph` |
+| `synthesis.graph_analysis` | `condense_to_dag()` → `CondensationResult`, `compute_augmentation_bound()` → `AugmentationBound` |
+| `synthesis.delta_minimizer` | `delta_minimize(graph, domain, llm_fn=)` → `DeltaMinimizationResult`, `ScoringConfig`, `CandidateEdge` |
+| `synthesis.ppddl_emitter` | `emit_ppddl(domain, output_path=, config=)` → PPDDL string, `PolicyExpansionConfig` |
 
 ---
 
-## 3. Usage & Examples
-
-### 3.1 Installation
+## 4. Installation
 
 ```bash
-# Clone the repository
 git clone https://github.com/your-username/pyrmdp.git
 cd pyrmdp
 
-# Install dependencies and the package
+# Core (FODDs + synthesis pipeline)
 pip install -e .
+
+# With LLM support (OpenAI)
+pip install -e ".[llm]"
+
+# With Z3 strong reduction
+pip install -e ".[z3]"
+
+# Everything
+pip install -e ".[all]"
 ```
 
-### 3.2 Running the Scripts
-
-The `scripts/` directory contains tools to generate diagrams and visualizations.
-
-**Generate an Algebraic Decision Diagram (ADD) from PPDDL:**
+The synthesis pipeline also requires **pyPPDDL** for domain parsing:
 
 ```bash
-# Ensure you are in the root directory (pyrmdp)
-python3 scripts/generate_add.py
+pip install -e /path/to/pyPPDDL
 ```
 
-This script parses a PPDDL domain file and generates a representative First-Order Decision Diagram (FODD) visualizing the logical structure.
+### Dependencies
 
-**Generate a Markov Chain visualization:**
-
-```bash
-python3 scripts/generate_markov.py
-```
-
-### 3.3 Visualization
-
-The library outputs interactive HTML files (using `pyvis`) that allow you to explore the state space structure.
-
-*   **Nodes:** Represent logical tests (e.g., `at(?r, ?l1)`).
-*   **Edges:** Green = True branch, Red = False branch.
-*   **Leaves:** Represent value function values or policy actions.
-
-After running the scripts, look for generated `.html` files in your workspace (e.g., `fodd_structure.html`).
+| Package | Required | Purpose |
+|---------|----------|---------|
+| `numpy`, `scipy` | ✅ | Transition matrices, spectral analysis |
+| `networkx` | ✅ | SCC condensation, graph algorithms |
+| `pyvis` | ✅ | Interactive HTML visualization |
+| `openai` | Optional | LLM failure hallucination & operator synthesis |
+| `z3-solver` | Optional | Strong reduction (R5) |
 
 ---
 
-## 4. References
+## 5. Quick Start
+
+### 5.1 FODD Visualization
+
+```bash
+# Build an FODD from a PPDDL domain
+python scripts/generate_add.py
+
+# Build an abstract Markov chain
+python scripts/generate_markov.py
+```
+
+Both produce interactive `.html` files viewable in a browser.
+
+### 5.2 Running the Synthesis Pipeline
+
+**With mock LLM (no API key needed):**
+
+```bash
+python scripts/test_pipeline.py
+```
+
+This runs the full 6-step pipeline on a tabletop-grid-reward domain and prints progress for each step.
+
+**Programmatic usage:**
+
+```python
+from pyppddl.ppddl.parser import load_domain
+from pyrmdp.core.fodd import FODDManager
+from pyrmdp.synthesis import (
+    hallucinate_failures,
+    build_transition_fodd,
+    enumerate_abstract_states,
+    condense_to_dag,
+    compute_augmentation_bound,
+    delta_minimize,
+    emit_ppddl,
+    ScoringConfig,
+)
+from pyrmdp.synthesis.fodd_builder import build_global_order
+
+# Step 0: Parse
+domain = load_domain("domain.pddl")
+
+# Step 1: Hallucinate failures (pass llm_fn= for custom LLM)
+domain, failures = hallucinate_failures(domain, failure_prob=0.1)
+
+# Step 2: Build lifted FODDs → abstract state graph
+manager = FODDManager(global_order=build_global_order(domain))
+composed, action_fodds = build_transition_fodd(domain.actions, manager)
+graph = enumerate_abstract_states(action_fodds, manager, domain)
+
+# Steps 3–4: Condense + bound
+condensation = condense_to_dag(graph)
+bound = compute_augmentation_bound(condensation)
+print(f"MSCA bound: {bound.bound}")
+
+# Step 5: Synthesize recovery operators
+result = delta_minimize(graph, domain, config=ScoringConfig(max_iterations=20))
+print(f"Irreducible: {result.is_irreducible}")
+
+# Step 6: Emit multi-policy PPDDL
+ppddl = emit_ppddl(domain, output_path="robustified.ppddl")
+```
+
+---
+
+## 6. References
 
 1.  **Boutilier, C., Reiter, R., & Price, B. (2001).** Symbolic dynamic programming for first-order MDPs. *IJCAI*, 1, 690-700.
 2.  **Wang, C., Joshi, S., & Khardon, R. (2008).** First order decision diagrams for relational MDPs. *Journal of Artificial Intelligence Research*, 31, 431-472.
+3.  **Eswaran, K. P. & Tarjan, R. E. (1976).** Augmentation problems. *SIAM Journal on Computing*, 5(4), 653-665. *(MSCA theorem)*

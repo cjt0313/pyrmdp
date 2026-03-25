@@ -9,36 +9,50 @@ class SyntacticReducer:
     def simplify(self, roots: List[int]) -> List[int]:
         """
         Applies R1 (Neglect) and R3 (Merge) to the given roots, using memoization.
+        Path assignments track (atom, truth_value) pairs so R3 correctly follows
+        the True or False branch depending on how the atom was reached.
         """
         memo = {}
 
-        def _simplify(node_id: int, path_queries: List[Atom]) -> int:
-            if node_id in memo:
-                return memo[node_id]
+        def _simplify(node_id: int, path_assignments: frozenset) -> int:
+            cache_key = (node_id, path_assignments)
+            if cache_key in memo:
+                return memo[cache_key]
 
             node = self.manager.nodes[node_id]
             if node.is_leaf:
                 return node_id
 
-            # Apply R3: If query already in path, skip node based on its truth value.
-            for q in path_queries:
-                if q == node.query:
-                    # Depending on path logic. For syntactic, this simply prunes based on truth value.
-                    return _simplify(node.high, path_queries) # naive truth assumption if in path
+            # Apply R3: If query already tested on the path, follow the
+            # branch consistent with the recorded truth assignment.
+            for (atom, truth_val) in path_assignments:
+                if atom == node.query:
+                    if truth_val:
+                        result = _simplify(node.high, path_assignments)
+                    else:
+                        result = _simplify(node.low, path_assignments)
+                    memo[cache_key] = result
+                    return result
                     
-            high = _simplify(node.high, path_queries + [node.query])
-            low = _simplify(node.low, path_queries)
+            high = _simplify(
+                node.high,
+                path_assignments | {(node.query, True)}
+            )
+            low = _simplify(
+                node.low,
+                path_assignments | {(node.query, False)}
+            )
 
             # Apply R1: Neglect if high == low
             if high == low:
-                memo[node_id] = high
-                return memo[node_id]
+                memo[cache_key] = high
+                return high
 
             new_node_id = self.manager.get_node(node.query, high, low)
-            memo[node_id] = new_node_id
+            memo[cache_key] = new_node_id
             return new_node_id
 
-        return [_simplify(r, []) for r in roots]
+        return [_simplify(r, frozenset()) for r in roots]
 
 class StrongReducer:
     def __init__(self, manager: FODDManager, axioms: str):

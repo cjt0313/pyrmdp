@@ -1,0 +1,18 @@
+# pyrmdp LLM configuration
+# ─────────────────────────
+# Loaded automatically by the synthesis pipeline.
+# Any field can be overridden via PYRMDP_<FIELD> env-vars, e.g.:
+#   PYRMDP_MODEL=gpt-4-turbo  PYRMDP_TEMPERATURE=0.5
+#
+# The api_key falls back to $OPENAI_API_KEY if not set here.
+
+provider: openai          # openai | azure | custom
+# api_key: sk-...         # or set OPENAI_API_KEY env-var
+# base_url: null          # for self-hosted / vLLM / Ollama endpoints
+
+model: gpt-4o
+temperature: 0.7
+max_tokens: 1024
+top_p: 1.0
+timeout: 60.0             # seconds per request
+max_retries: 2
