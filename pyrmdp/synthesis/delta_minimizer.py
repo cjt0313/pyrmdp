@@ -11,7 +11,6 @@ Scoring: α·(1 − norm_delta) + β·(norm_gain), default α=0.7, β=0.3.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from dataclasses import dataclass, field
@@ -26,6 +25,7 @@ from .graph_analysis import (
     condense_to_dag,
     get_scc_representative_predicates,
 )
+from .prompts.llm_recovery_prompt import build_recovery_prompt, parse_recovery_response
 
 # pyPPDDL data model
 try:
@@ -86,6 +86,8 @@ class SynthesizedOperator:
     source_scc: int
     sink_scc: int
     delta: int
+    sink_node: str = ""
+    source_node: str = ""
     action_schema: Optional[ActionSchema] = None
 
 
@@ -97,6 +99,7 @@ class DeltaMinimizationResult:
     final_sources: List[int]
     final_sinks: List[int]
     is_irreducible: bool
+    augmented_graph: Optional[nx.DiGraph] = None
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -131,67 +134,110 @@ def calculate_logical_hamming_distance(
     return len(must_delete) + len(must_add) + len(new_true) + len(new_false)
 
 
+def mutex_aware_hamming_distance(
+    true_preds_u: Set[str],
+    false_preds_u: Set[str],
+    true_preds_v: Set[str],
+    false_preds_v: Set[str],
+    mutex_groups: Optional[List[Any]] = None,
+) -> int:
+    """
+    Mutex-corrected logical Hamming distance between two abstract states.
+
+    Standard Hamming counts switching from ``opened`` to ``closed`` as
+    δ=2 (one add + one delete).  But if ``{opened, closed}`` form an
+    exactly-one group, the switch is really **one** atomic change → δ=1.
+
+    Algorithm:
+      1. Compute standard add/delete sets.
+      2. For each mutex group, greedily match a *must_add* member with
+         a *must_delete* member.  Each match reduces distance by 1.
+
+    Parameters
+    ----------
+    true_preds_u, false_preds_u : set[str]
+        Source state truth assignment.
+    true_preds_v, false_preds_v : set[str]
+        Target state truth assignment.
+    mutex_groups : list[ExactlyOneGroup], optional
+        Exactly-one mutex groups.  If *None* or empty, falls back to
+        the standard distance.
+
+    Returns
+    -------
+    int
+        Corrected distance.
+    """
+    # Standard components
+    must_delete = true_preds_u & false_preds_v
+    must_add = false_preds_u & true_preds_v
+    new_true = true_preds_v - true_preds_u - false_preds_u
+    new_false = false_preds_v - true_preds_u - false_preds_u
+
+    base = len(must_delete) + len(must_add) + len(new_true) + len(new_false)
+
+    if not mutex_groups:
+        return base
+
+    # Greedy pairing: for each group, if one member is in must_add AND
+    # another is in must_delete, they form a single swap → save 1.
+    savings = 0
+    paired_add: Set[str] = set()
+    paired_del: Set[str] = set()
+
+    for grp in mutex_groups:
+        group_preds = set(grp.predicates)
+        add_in_group = (must_add & group_preds) - paired_add
+        del_in_group = (must_delete & group_preds) - paired_del
+
+        # Pair them 1:1 greedily
+        pairs = min(len(add_in_group), len(del_in_group))
+        if pairs > 0:
+            # Mark as paired (take arbitrary elements)
+            for a, d in zip(sorted(add_in_group), sorted(del_in_group)):
+                paired_add.add(a)
+                paired_del.add(d)
+                savings += 1
+                if len(paired_add) >= pairs:
+                    break
+
+    return base - savings
+
+
 # ════════════════════════════════════════════════════════════════════
 #  LLM Operator Synthesis
 # ════════════════════════════════════════════════════════════════════
 
 def _build_synthesis_prompt(candidate: CandidateEdge) -> str:
-    """Build the LLM prompt for operator synthesis."""
-    return f"""You are a PDDL domain expert. Synthesize a PPDDL operator that
-transitions the world from State U (a sink state) to State V (a source state).
+    """Build the LLM prompt for operator synthesis.
 
-State U (Sink SCC {candidate.sink_scc}):
-  True predicates:  {sorted(candidate.sink_true_preds)}
-  False predicates: {sorted(candidate.sink_false_preds)}
-
-State V (Source SCC {candidate.source_scc}):
-  True predicates:  {sorted(candidate.source_true_preds)}
-  False predicates: {sorted(candidate.source_false_preds)}
-
-Required change (delta): {candidate.delta} predicates must change.
-
-Requirements:
-1. Create a valid PPDDL operator with typed parameters, preconditions, and effects.
-2. The precondition should be satisfiable in State U.
-3. The nominal effect should produce State V (or move towards it).
-4. Hallucinate ONE physically plausible "worse effect" (failure mode).
-5. Keep the operator generalizable with parametrized variables.
-
-Respond with ONLY valid JSON:
-{{
-    "name": "recover_action_name",
-    "parameters": [{{"name": "?obj", "type": "physical-item"}}],
-    "preconditions": [["pred_name", "?arg1", "?arg2"]],
-    "nominal_add": [["pred_name", "?arg1"]],
-    "nominal_del": [["pred_name", "?arg1"]],
-    "failure_add": [["pred_name", "?arg1"]],
-    "failure_del": [["pred_name", "?arg1"]],
-    "numeric_effects": [["decrease", "reward", 1]],
-    "explanation": "This recovery action does X."
-}}
-"""
+    Delegates to :mod:`prompts.llm_recovery_prompt` and concatenates
+    system + user for the text-only ``llm_fn(prompt) → str`` interface.
+    """
+    parts = build_recovery_prompt(
+        sink_scc=candidate.sink_scc,
+        source_scc=candidate.source_scc,
+        sink_true_preds=candidate.sink_true_preds,
+        sink_false_preds=candidate.sink_false_preds,
+        source_true_preds=candidate.source_true_preds,
+        source_false_preds=candidate.source_false_preds,
+        delta=candidate.delta,
+    )
+    return parts["system"] + "\n\n" + parts["user"]
 
 
 def _parse_synthesis_response(
     response_text: str,
     candidate: CandidateEdge,
 ) -> Optional[SynthesizedOperator]:
-    """Parse the LLM JSON response into a SynthesizedOperator."""
-    try:
-        text = response_text.strip()
-        if "```json" in text:
-            text = text.split("```json")[1].split("```")[0].strip()
-        elif "```" in text:
-            text = text.split("```")[1].split("```")[0].strip()
+    """Parse the LLM JSON response into a SynthesizedOperator.
 
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        if start < 0 or end <= start:
-            return None
-
-        data = json.loads(text[start:end])
-    except (json.JSONDecodeError, IndexError) as e:
-        logger.warning(f"Failed to parse LLM synthesis response: {e}")
+    Delegates JSON extraction to :func:`prompts.llm_recovery_prompt.parse_recovery_response`,
+    then converts the raw dict into a :class:`SynthesizedOperator`.
+    """
+    fallback_name = f"recover_{candidate.sink_scc}_to_{candidate.source_scc}"
+    data = parse_recovery_response(response_text, fallback_name=fallback_name)
+    if data is None:
         return None
 
     # Build parameters
@@ -288,6 +334,7 @@ def delta_minimize(
     config: Optional[ScoringConfig] = None,
     nominal_prob: float = 0.9,
     failure_prob: float = 0.1,
+    mutex_groups: Optional[List[Any]] = None,
 ) -> DeltaMinimizationResult:
     """
     Iteratively synthesize recovery operators to make the abstract
@@ -308,6 +355,9 @@ def delta_minimize(
         Probability for the nominal (success) effect of synthesized operators.
     failure_prob : float
         Probability for the failure effect of synthesized operators.
+    mutex_groups : list[ExactlyOneGroup], optional
+        If provided, uses :func:`mutex_aware_hamming_distance` instead
+        of the naïve logical Hamming distance.
 
     Returns
     -------
@@ -357,17 +407,34 @@ def delta_minimize(
                     src_id, condensation
                 )
 
-                delta = calculate_logical_hamming_distance(
-                    sink_true, sink_false, src_true, src_false
-                )
+                if mutex_groups:
+                    delta = mutex_aware_hamming_distance(
+                        sink_true, sink_false, src_true, src_false,
+                        mutex_groups=mutex_groups,
+                    )
+                else:
+                    delta = calculate_logical_hamming_distance(
+                        sink_true, sink_false, src_true, src_false
+                    )
 
                 if delta > config.delta_threshold:
                     continue
 
-                # Topological gain heuristic
+                # Topological gain: prefer pairs where source can reach
+                # sink in the DAG (adding sink→source closes a cycle).
                 gain = 0
-                gain += 1 if sink_id in aug_bound.sinks else 0
-                gain += 1 if src_id in aug_bound.sources else 0
+                if nx.has_path(condensation.dag, src_id, sink_id):
+                    # This edge would close a cycle → high gain
+                    # Estimate merged nodes by path length
+                    try:
+                        path_len = nx.shortest_path_length(
+                            condensation.dag, src_id, sink_id
+                        )
+                        gain = path_len + 1  # nodes merged into SCC
+                    except nx.NetworkXNoPath:
+                        gain = 1
+                else:
+                    gain = 0  # no cycle formed, low priority
 
                 candidates.append(CandidateEdge(
                     sink_scc=sink_id,
@@ -426,15 +493,20 @@ def delta_minimize(
             sink_members = condensation.scc_state_map.get(candidate.sink_scc, [])
             src_members = condensation.scc_state_map.get(candidate.source_scc, [])
             if sink_members and src_members:
+                from_node = sink_members[0]
+                to_node = src_members[0]
                 working_graph.add_edge(
-                    sink_members[0],
-                    src_members[0],
+                    from_node,
+                    to_node,
                     action=op.name,
                     prob=nominal_prob,
                 )
+                # Store original node IDs for correct replay/visualization
+                op.sink_node = from_node
+                op.source_node = to_node
 
             operator_added = True
-            logger.info(f"    ✓ Synthesized: {op.name}")
+            logger.info(f"    ✓ Synthesized: {op.name} ({op.sink_node} → {op.source_node})")
             break
 
         if not operator_added:
@@ -465,4 +537,5 @@ def delta_minimize(
         final_sources=final_bound.sources,
         final_sinks=final_bound.sinks,
         is_irreducible=final_bound.is_already_irreducible,
+        augmented_graph=working_graph,
     )

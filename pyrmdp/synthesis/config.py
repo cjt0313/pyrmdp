@@ -50,6 +50,10 @@ class PipelineConfig:
     failure_prob: float = 0.1
     """Probability assigned to the failure branch of each action."""
 
+    # ── Step 2: Abstract State Pruning ────────────────────────────
+    enable_mutex_pruning: bool = False
+    """Enable R5 (LLM-based mutex pruning) after abstract state enumeration."""
+
     # ── Step 5: Delta Minimization ───────────────────────────────
     scoring_alpha: float = 0.7
     """Weight for delta similarity (lower delta → higher score)."""
@@ -97,6 +101,9 @@ class PipelineConfig:
 
     save_intermediates: bool = False
     """Whether to persist per-step JSON/GraphML alongside the PPDDL."""
+
+    visualize: bool = True
+    """Generate interactive evolution.html visualization after the pipeline."""
 
     # ══════════════════════════════════════════════════════════════
     #  Factory methods → step-specific config objects
@@ -160,6 +167,9 @@ class PipelineConfig:
             ],
             "# ── Step 1: Failure Hallucination": [
                 "failure_prob",
+            ],
+            "# ── Step 2: Abstract State Pruning": [
+                "enable_mutex_pruning",
             ],
             "# ── Step 5: Delta Minimization": [
                 "scoring_alpha", "scoring_beta", "max_delta_iterations",

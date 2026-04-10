@@ -30,8 +30,9 @@ from __future__ import annotations
 import base64
 import logging
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Union
 
 from .prompts.vlm_domain_prompt import (
     build_vlm_domain_prompt,
@@ -43,6 +44,83 @@ from .prompts.llm_operator_prompt import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Result container
+# ════════════════════════════════════════════════════════════════════
+
+@dataclass
+class GenesisResult:
+    """Structured output of :func:`generate_initial_domain`.
+
+    Attributes
+    ----------
+    domain : Any
+        Parsed ``pyPPDDL.Domain`` object (or None if parse failed).
+    pddl_str : str
+        Assembled PDDL string.
+    vlm_fragment : str
+        Raw VLM output (types + predicates only, before LLM operators).
+    vlm_types : Set[str]
+        Type names that originated from the VLM.
+    vlm_predicates : Set[str]
+        Predicate names that originated from the VLM.
+    mutex_groups : list
+        Exactly-one mutex groups (list of ExactlyOneGroup) identified
+        from the domain predicates.  Empty if not queried.
+    mutex_pairwise_rules : list
+        Pairwise MutexRules derived from the mutex groups (positive_mutex
+        + negative_mutex for every pair).  Empty if not queried.
+    """
+    domain: Any = None
+    pddl_str: str = ""
+    vlm_fragment: str = ""
+    vlm_types: Set[str] = field(default_factory=set)
+    vlm_predicates: Set[str] = field(default_factory=set)
+    mutex_groups: list = field(default_factory=list)
+    mutex_pairwise_rules: list = field(default_factory=list)
+
+
+def _extract_names_from_fragment(fragment: str) -> tuple:
+    """Parse a VLM PDDL fragment to extract type and predicate names.
+
+    Returns (types: set[str], predicates: set[str]).
+    """
+    types: set = set()
+    predicates: set = set()
+
+    # ── Types ──
+    m = re.search(r"\(:types\s+(.*?)\)", fragment, re.DOTALL)
+    if m:
+        types_block = m.group(1)
+        for line in types_block.split("\n"):
+            line = line.strip()
+            if not line or line.startswith(";"):
+                continue
+            if " - " in line:
+                children_str, _ = line.rsplit(" - ", 1)
+                for tok in children_str.split():
+                    tok = tok.strip()
+                    if tok and not tok.startswith(";"):
+                        types.add(tok)
+            else:
+                for tok in line.split():
+                    tok = tok.strip()
+                    if tok and not tok.startswith(";"):
+                        types.add(tok)
+
+    # ── Predicates ──
+    m = re.search(r"\(:predicates\s+(.*?)(?:\)\s*(?:\(:|\Z))", fragment, re.DOTALL)
+    if m:
+        pred_block = m.group(1)
+        for pred_str in re.findall(r"\(([^()]+)\)", pred_block):
+            pred_str = pred_str.strip()
+            if pred_str and not pred_str.startswith(";"):
+                name = pred_str.split()[0]
+                predicates.add(name)
+
+    return types, predicates
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -203,7 +281,7 @@ def generate_initial_domain(
     vlm_fn: Optional[Callable] = None,
     llm_fn: Optional[Callable] = None,
     return_parsed: bool = False,
-) -> Union[str, Any]:
+) -> Union[str, Any, GenesisResult]:
     """
     Generate a complete PDDL domain from RGB observations and task text.
 
@@ -226,14 +304,18 @@ def generate_initial_domain(
     llm_fn : callable, optional
         ``fn(prompt) → str``.  If None, built from ``llm.yaml`` config.
     return_parsed : bool
-        If True and pyPPDDL is available, return a parsed ``Domain``
-        object instead of a raw string.
+        If True and pyPPDDL is available, return a ``GenesisResult``
+        containing the parsed Domain, the PDDL string, the raw VLM
+        fragment, and the sets of VLM-originated type/predicate names.
+        If False, returns just the PDDL string (legacy behavior).
 
     Returns
     -------
-    str or Domain
-        The assembled PDDL domain string, or a ``pyPPDDL.Domain``
-        object if ``return_parsed=True``.
+    str or GenesisResult
+        When ``return_parsed=False``: the assembled PDDL domain string.
+        When ``return_parsed=True``: a :class:`GenesisResult` with
+        ``.domain``, ``.pddl_str``, ``.vlm_fragment``,
+        ``.vlm_types``, and ``.vlm_predicates``.
     """
     # ── Phase A: VLM → types + predicates ──────────────────────────
 
@@ -266,11 +348,48 @@ def generate_initial_domain(
         task_descriptions=task_descriptions,
     )
 
-    # The shared build_llm_fn returns fn(prompt)->str (single string).
-    # We concatenate system + user for the text-only call.
-    full_prompt = prompt_b["system"] + "\n\n" + prompt_b["user"]
-    raw_llm = llm_call(full_prompt)
+    # Use system+user separation if the llm_fn supports it (keyword arg),
+    # otherwise fall back to concatenation for backward compatibility.
+    import inspect
+    _sig = inspect.signature(llm_call)
+    _supports_system = "system" in _sig.parameters
+
+    if _supports_system:
+        raw_llm = llm_call(prompt_b["user"], system=prompt_b["system"])
+    else:
+        full_prompt = prompt_b["system"] + "\n\n" + prompt_b["user"]
+        raw_llm = llm_call(full_prompt)
     operator_fragment = parse_llm_operator_response(raw_llm)
+
+    # Count how many actions were generated
+    action_count = operator_fragment.count("(:action")
+
+    # If 0 actions were returned, retry once — but still constrain to task-specified ops
+    if action_count == 0 and len(task_descriptions) > 0:
+        logger.warning(
+            "  LLM returned 0 action(s) — retrying …",
+        )
+        retry_suffix = (
+            "\n\nIMPORTANT: You returned 0 actions. "
+            "Re-read the task descriptions carefully and generate one PDDL action "
+            "for each distinct manipulation skill that is DIRECTLY described or "
+            "directly implied by the task sentences. Do NOT add extra operators "
+            "beyond what the tasks specify.\n"
+        )
+
+        retry_user = prompt_b["user"] + retry_suffix
+        if _supports_system:
+            raw_llm_retry = llm_call(retry_user, system=prompt_b["system"])
+        else:
+            raw_llm_retry = llm_call(prompt_b["system"] + "\n\n" + retry_user)
+        retry_fragment = parse_llm_operator_response(raw_llm_retry)
+        retry_count = retry_fragment.count("(:action")
+        if retry_count > 0:
+            operator_fragment = retry_fragment
+            logger.info(
+                "  Retry produced %d action(s)",
+                retry_count,
+            )
 
     logger.info("  LLM returned operators (%d chars)", len(operator_fragment))
     logger.debug("  Operator fragment:\n%s", operator_fragment)
@@ -280,17 +399,69 @@ def generate_initial_domain(
     pddl_str = _assemble_domain(domain_fragment, operator_fragment)
     logger.info("Step 0: Domain genesis complete (%d chars)", len(pddl_str))
 
+    # ── Extract VLM origin names ──────────────────────────────────
+    vlm_types, vlm_predicates = _extract_names_from_fragment(domain_fragment)
+    logger.info(
+        "  VLM originated: %d types, %d predicates",
+        len(vlm_types), len(vlm_predicates),
+    )
+
     if return_parsed:
+        parsed_domain = None
         try:
-            from pyppddl.ppddl.parser import load_domain_from_string
-            return load_domain_from_string(pddl_str)
+            from pyppddl.ppddl.parser import parse_domain
+            parsed_domain = parse_domain(pddl_str)
         except ImportError:
             logger.warning(
-                "pyPPDDL not installed — returning raw PDDL string instead."
+                "pyPPDDL not installed — domain will be None in GenesisResult."
             )
         except Exception as exc:
             logger.warning(
-                "Failed to parse generated PDDL: %s — returning raw string.", exc
+                "Failed to parse generated PDDL: %s — domain will be None.", exc
             )
+
+        # ── Phase C: Query mutex groups (SAS+) ───────────────────
+        mutex_groups = []
+        mutex_pairwise_rules = []
+
+        if parsed_domain is not None:
+            try:
+                from pyrmdp.pruning.llm_axiom import generate_mutex_groups
+
+                # Build full predicate signatures: "pred_name ?v1 ?v2 ..."
+                pred_sigs = []
+                for pred in parsed_domain.predicates:
+                    sig_parts = [pred.name] + [p.name for p in pred.parameters]
+                    pred_sigs.append(" ".join(sig_parts))
+
+                if pred_sigs:
+                    logger.info(
+                        "Step 0c: Querying LLM for mutex groups "
+                        "(%d predicates) …",
+                        len(pred_sigs),
+                    )
+                    mutex_groups, mutex_pairwise_rules = generate_mutex_groups(
+                        pred_sigs,
+                        llm_fn=llm_call,
+                        valid_predicate_names=vlm_predicates,
+                    )
+                    logger.info(
+                        "  Found %d mutex groups → %d pairwise rules",
+                        len(mutex_groups), len(mutex_pairwise_rules),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Mutex group query failed: %s — continuing without.", exc,
+                )
+
+        return GenesisResult(
+            domain=parsed_domain,
+            pddl_str=pddl_str,
+            vlm_fragment=domain_fragment,
+            vlm_types=vlm_types,
+            vlm_predicates=vlm_predicates,
+            mutex_groups=mutex_groups,
+            mutex_pairwise_rules=mutex_pairwise_rules,
+        )
 
     return pddl_str

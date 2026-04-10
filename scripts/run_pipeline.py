@@ -47,12 +47,14 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_DIR.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
 
 import networkx as nx  # noqa: F401  (kept for _save_graph helper)
 
 from pyrmdp.synthesis.llm_config import LLMConfig, load_config, build_llm_fn
 from pyrmdp.synthesis.config import PipelineConfig
-from pyrmdp.synthesis.domain_genesis import generate_initial_domain
+from pyrmdp.synthesis.domain_genesis import generate_initial_domain, GenesisResult
 from pyrmdp.synthesis.iterative_synthesizer import IterativeDomainSynthesizer
 
 # pyPPDDL parser
@@ -62,6 +64,8 @@ except ImportError:
     load_domain = None
     Domain = None
 
+# Visualization (same scripts/ directory)
+from visualize_evolution import load_pipeline_data, generate_html as generate_evolution_html
 
 logger = logging.getLogger("pyrmdp.pipeline")
 
@@ -125,6 +129,40 @@ class StepTimer:
         logger.info(f"  ⏱  {self.step_name} completed in {self.elapsed:.1f}s")
 
 
+def _build_origin_map(domain, vlm_types: set, vlm_predicates: set) -> dict:
+    """Compare final domain types/predicates against VLM fragment names.
+
+    Returns a dict like::
+
+        {
+            "types": {"block": "vlm", "gripper-stuck": "llm", ...},
+            "predicates": {"on": "vlm", "jammed": "llm", ...}
+        }
+
+    Anything present in the VLM fragment is tagged ``"vlm"``.
+    Anything introduced later (by LLM operators or failure hallucination)
+    is tagged ``"llm"``.
+    """
+    origin: Dict[str, Dict[str, str]] = {"types": {}, "predicates": {}}
+
+    # Types
+    if hasattr(domain, "types") and domain.types:
+        for type_name in domain.types:
+            origin["types"][type_name] = (
+                "vlm" if type_name in vlm_types else "llm"
+            )
+
+    # Predicates
+    if hasattr(domain, "predicates") and domain.predicates:
+        for pred in domain.predicates:
+            name = pred.name if hasattr(pred, "name") else str(pred)
+            origin["predicates"][name] = (
+                "vlm" if name in vlm_predicates else "llm"
+            )
+
+    return origin
+
+
 # ════════════════════════════════════════════════════════════════════
 #  Pipeline
 # ════════════════════════════════════════════════════════════════════
@@ -176,6 +214,17 @@ def run_pipeline(
         domain = load_domain(domain_path)
         pddl_str = Path(domain_path).read_text(encoding="utf-8")
 
+        # When loading from file, tag everything as 'input' (no VLM/LLM distinction)
+        origin_map: Dict[str, Dict[str, str]] = {"types": {}, "predicates": {}}
+        if hasattr(domain, "types") and domain.types:
+            for tn in domain.types:
+                origin_map["types"][tn] = "input"
+        if hasattr(domain, "predicates") and domain.predicates:
+            for pred in domain.predicates:
+                pn = pred.name if hasattr(pred, "name") else str(pred)
+                origin_map["predicates"][pn] = "input"
+        _save_json(out / "step0_origins.json", origin_map)
+
         if cfg.save_intermediates:
             _save_text(out / "step0_domain_input.pddl", pddl_str)
     else:
@@ -198,7 +247,48 @@ def run_pipeline(
             )
         timings["step0"] = t.elapsed
 
-        if isinstance(result, str):
+        if isinstance(result, GenesisResult):
+            domain = result.domain
+            pddl_str = result.pddl_str
+
+            if domain is None:
+                # Parse failed inside genesis — try again here
+                if load_domain is None:
+                    raise ImportError(
+                        "pyPPDDL is required for Steps 1–6.  "
+                        "pip install -e /path/to/pyPPDDL"
+                    )
+                from pyppddl.ppddl.parser import parse_domain
+                try:
+                    domain = parse_domain(pddl_str)
+                except Exception as exc:
+                    logger.error(
+                        "Failed to parse generated PDDL domain:\n%s\n\nError: %s",
+                        pddl_str, exc,
+                    )
+                    raise RuntimeError(
+                        f"Step 0 produced malformed PDDL (parse error: {exc}).  "
+                        "Try increasing max_tokens in llm.yaml or use a "
+                        "different model."
+                    ) from exc
+
+            # ── Save VLM origin metadata ──
+            if cfg.save_intermediates:
+                _save_text(out / "step0_vlm_fragment.pddl", result.vlm_fragment)
+
+            # Build origin map: compare VLM names against final domain
+            origin_map = _build_origin_map(domain, result.vlm_types, result.vlm_predicates)
+            _save_json(out / "step0_origins.json", origin_map)
+            logger.info(
+                "  Origin tracking: %d VLM types, %d LLM types, "
+                "%d VLM predicates, %d LLM predicates",
+                sum(1 for v in origin_map["types"].values() if v == "vlm"),
+                sum(1 for v in origin_map["types"].values() if v == "llm"),
+                sum(1 for v in origin_map["predicates"].values() if v == "vlm"),
+                sum(1 for v in origin_map["predicates"].values() if v == "llm"),
+            )
+
+        elif isinstance(result, str):
             pddl_str = result
             if cfg.save_intermediates:
                 _save_text(out / "step0_domain_generated.pddl", pddl_str)
@@ -208,8 +298,19 @@ def run_pipeline(
                     "pyPPDDL is required for Steps 1–6.  "
                     "pip install -e /path/to/pyPPDDL"
                 )
-            from pyppddl.ppddl.parser import load_domain_from_string
-            domain = load_domain_from_string(pddl_str)
+            from pyppddl.ppddl.parser import parse_domain
+            try:
+                domain = parse_domain(pddl_str)
+            except Exception as exc:
+                logger.error(
+                    "Failed to parse generated PDDL domain:\n%s\n\nError: %s",
+                    pddl_str, exc,
+                )
+                raise RuntimeError(
+                    f"Step 0 produced malformed PDDL (parse error: {exc}).  "
+                    "Try increasing max_tokens in llm.yaml or use a "
+                    "different model."
+                ) from exc
         else:
             domain = result
             pddl_str = "(generated domain — see parsed object)"
@@ -236,9 +337,44 @@ def run_pipeline(
         emission_config=cfg.emission_config(),
         output_dir=str(out),
         save_intermediates=cfg.save_intermediates,
+        enable_mutex_pruning=cfg.enable_mutex_pruning,
     )
 
     ppddl_output = synth.run()
+
+    # ── Update origin map with Step 1 hallucinated predicates/types ──
+    origins_path = out / "step0_origins.json"
+    if origins_path.exists():
+        try:
+            origin_map = json.loads(origins_path.read_text(encoding="utf-8"))
+        except Exception:
+            origin_map = {"types": {}, "predicates": {}}
+
+        # Scan failure JSONs for new_predicates / new_types
+        for fpath in sorted(out.glob("iter*_step1_failures.json")):
+            try:
+                fail_data = json.loads(fpath.read_text(encoding="utf-8"))
+                items = fail_data if isinstance(fail_data, list) else fail_data.get("failures", [])
+                for f in items:
+                    for np in f.get("new_predicates", []):
+                        if np not in origin_map["predicates"]:
+                            origin_map["predicates"][np] = "hallucination"
+                    nt_raw = f.get("new_types", [])
+                    if isinstance(nt_raw, dict):
+                        nt_raw = list(nt_raw.keys())
+                    for nt in nt_raw:
+                        if nt not in origin_map["types"]:
+                            origin_map["types"][nt] = "hallucination"
+            except Exception:
+                pass
+
+        _save_json(origins_path, origin_map)
+        logger.info(
+            "  Updated origins: %d VLM / %d LLM / %d hallucinated predicates",
+            sum(1 for v in origin_map["predicates"].values() if v == "vlm"),
+            sum(1 for v in origin_map["predicates"].values() if v == "llm"),
+            sum(1 for v in origin_map["predicates"].values() if v == "hallucination"),
+        )
 
     # Print convergence summary
     summary = synth.summary()
@@ -248,6 +384,24 @@ def run_pipeline(
     logger.info(f"  Iterations: {summary['iterations']}")
     if summary['spectral_distances']:
         logger.info(f"  Final Δ_spectral: {summary['spectral_distances'][-1]:.6f}")
+
+    # ────────────────────────────────────────────────────────────────
+    # Visualization: generate interactive evolution HTML
+    # ────────────────────────────────────────────────────────────────
+    if cfg.visualize and cfg.save_intermediates:
+        try:
+            vis_data = load_pipeline_data(out)
+            if "graph" in vis_data:
+                html_str = generate_evolution_html(vis_data)
+                vis_path = out / "evolution.html"
+                vis_path.write_text(html_str, encoding="utf-8")
+                logger.info(f"  ✓ Saved visualization: {vis_path}")
+            else:
+                logger.warning("  ⚠ Skipping visualization: no abstract graph found")
+        except Exception as exc:
+            logger.warning(f"  ⚠ Visualization failed (non-fatal): {exc}")
+    elif cfg.visualize and not cfg.save_intermediates:
+        logger.info("  ℹ Visualization requires --save-intermediates; skipping.")
 
     return ppddl_output
 
@@ -321,6 +475,11 @@ def main():
         action="store_true", default=None,
         help="Save intermediate results (per-step JSON/GraphML).",
     )
+    output_group.add_argument(
+        "--no-visualize",
+        action="store_true", default=False,
+        help="Skip generating the interactive evolution.html visualization.",
+    )
 
     # ── Pipeline parameter overrides ──
     params_group = parser.add_argument_group(
@@ -350,6 +509,11 @@ def main():
         "--scoring-beta",
         type=float, default=None,
         help="Weight for topological gain in scoring (Step 5).",
+    )
+    params_group.add_argument(
+        "--enable-mutex-pruning",
+        action="store_true", default=None,
+        help="Enable R5 (LLM-based mutex pruning) to remove impossible abstract states.",
     )
     params_group.add_argument(
         "--epsilon",
@@ -397,6 +561,7 @@ def main():
 
     # Map CLI args → PipelineConfig field names
     cli_overrides = {
+        "enable_mutex_pruning": args.enable_mutex_pruning,
         "epsilon": args.epsilon,
         "max_loop_iterations": args.max_loop_iterations,
         "failure_prob": args.failure_prob,
@@ -410,6 +575,7 @@ def main():
         "human_reward": args.human_reward,
         "output_dir": args.output_dir,
         "save_intermediates": args.save_intermediates,
+        "visualize": False if args.no_visualize else None,
     }
     cfg = cfg.override_from_args(cli_overrides)
 

@@ -10,7 +10,6 @@ Uses pyPPDDL's data model (Domain, ActionSchema, Effect, Predicate, TypedParam).
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from copy import deepcopy
@@ -31,6 +30,8 @@ except ImportError:
         "pyPPDDL is required. Install it with: "
         "pip install -e /path/to/pyPPDDL"
     )
+
+from .prompts.llm_failure_prompt import build_failure_prompt, parse_failure_response
 
 logger = logging.getLogger(__name__)
 
@@ -94,57 +95,25 @@ def _format_action_for_prompt(action: ActionSchema, domain: Domain) -> str:
 
 
 def _build_failure_prompt(action_desc: str) -> str:
-    """Build the LLM prompt for failure hallucination."""
-    return f"""You are a robotics domain expert. Given the following PDDL operator, 
-hallucinate ONE physically plausible "worse effect" (failure mode) that could occur
-when executing this action. The failure should be different from "no change" (unchanged).
+    """Build the LLM prompt for failure hallucination.
 
-{action_desc}
-
-Requirements:
-1. The failure must be physically plausible for a robotics scenario.
-2. If the failure introduces a new physical state not captured by existing predicates,
-   propose NEW predicates (with typed parameters) and/or new types.
-3. The failure effect should be expressible as PDDL add/del effects.
-4. Keep it minimal — one failure mode, not multiple.
-
-Respond with ONLY valid JSON in this exact format:
-{{
-    "failure_add": [["pred_name", "?param1", "?param2"]],
-    "failure_del": [["pred_name", "?param1"]],
-    "failure_numeric": [["decrease", "reward", 10]],
-    "new_predicates": [
-        {{"name": "dropped", "parameters": [{{"name": "?obj", "type": "physical-item"}}]}}
-    ],
-    "new_types": {{"damaged-item": "physical-item"}},
-    "explanation": "The robot could drop the object while manipulating it."
-}}
-
-If no new predicates or types are needed, use empty lists/dicts for those fields.
-"""
+    Delegates to :mod:`prompts.llm_failure_prompt` and concatenates
+    system + user for the text-only ``llm_fn(prompt) → str`` interface.
+    """
+    parts = build_failure_prompt(action_desc)
+    return parts["system"] + "\n\n" + parts["user"]
 
 
 def _parse_llm_response(
     response_text: str, action: ActionSchema
 ) -> Optional[FailureHallucinationResult]:
-    """Parse the LLM JSON response into a FailureHallucinationResult."""
-    try:
-        # Extract JSON from response (handle markdown code fences)
-        text = response_text.strip()
-        if "```json" in text:
-            text = text.split("```json")[1].split("```")[0].strip()
-        elif "```" in text:
-            text = text.split("```")[1].split("```")[0].strip()
-        
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        if start < 0 or end <= start:
-            logger.warning(f"No JSON found in LLM response for {action.name}")
-            return None
-        
-        data = json.loads(text[start:end])
-    except (json.JSONDecodeError, IndexError) as e:
-        logger.warning(f"Failed to parse LLM response for {action.name}: {e}")
+    """Parse the LLM JSON response into a FailureHallucinationResult.
+
+    Delegates JSON extraction to :func:`prompts.llm_failure_prompt.parse_failure_response`,
+    then converts the raw dict into domain objects.
+    """
+    data = parse_failure_response(response_text, action_name=action.name)
+    if data is None:
         return None
     
     # Build the failure Effect

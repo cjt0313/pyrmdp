@@ -189,10 +189,26 @@ def build_llm_fn(config: Optional[LLMConfig] = None) -> Callable[[str], str]:
 
     client = OpenAI(**client_kwargs)
 
-    def _call(prompt: str) -> str:
+    def _call(prompt: str, *, system: str | None = None) -> str:
+        """Send a chat completion request.
+
+        Parameters
+        ----------
+        prompt : str
+            User message (or concatenated system+user for legacy callers).
+        system : str, optional
+            If provided, sent as a separate ``system`` role message for
+            better instruction following.  Otherwise *prompt* is sent as
+            a single ``user`` message.
+        """
+        messages: list[dict[str, str]] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
         resp = client.chat.completions.create(
             model=config.model,
-            messages=[{"role": "user", "content": prompt}],
+            messages=messages,
             temperature=config.temperature,
             max_tokens=config.max_tokens,
             top_p=config.top_p,

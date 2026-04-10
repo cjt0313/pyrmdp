@@ -214,6 +214,9 @@ class IterativeDomainSynthesizer:
         llm_fn: Optional[Callable[[str], str]] = None,
         output_dir: str = "./pipeline_output",
         save_intermediates: bool = False,
+        enable_mutex_pruning: bool = False,
+        mutex_groups: Optional[List] = None,
+        mutex_pairwise_rules: Optional[List] = None,
     ) -> None:
         self.domain = domain
         self.epsilon = epsilon
@@ -224,6 +227,15 @@ class IterativeDomainSynthesizer:
         self.llm_fn = llm_fn
         self.output_dir = Path(output_dir)
         self.save_intermediates = save_intermediates
+        self.enable_mutex_pruning = enable_mutex_pruning
+
+        # ── Mutex groups (SAS+ exactly-one) ──
+        self._mutex_groups: List = list(mutex_groups or [])
+        self._mutex_pairwise_rules: List = list(mutex_pairwise_rules or [])
+        # Track predicate names known when groups were last queried
+        self._mutex_pred_snapshot: Set[str] = {
+            p.name for p in domain.predicates
+        }
 
         self._prev_eigenvalues: np.ndarray = np.array([])
         self.history: List[IterationRecord] = []
@@ -266,16 +278,28 @@ class IterativeDomainSynthesizer:
         out = self._ensure_dir()
         path = out / filename
         G = graph.copy()
+        # Sanitize edge attributes for GraphML (only str/int/float/bool)
         for _, _, d in G.edges(data=True):
             for k, v in list(d.items()):
                 if isinstance(v, (set, frozenset)):
                     d[k] = ",".join(sorted(str(x) for x in v))
                 elif not isinstance(v, (str, int, float, bool)):
                     d[k] = str(v)
+        # Sanitize node attributes
         for _, d in G.nodes(data=True):
             for k, v in list(d.items()):
-                if not isinstance(v, (str, int, float, bool)):
+                if isinstance(v, (set, frozenset)):
+                    d[k] = ",".join(sorted(str(x) for x in v))
+                elif not isinstance(v, (str, int, float, bool)):
                     d[k] = str(v)
+        # Sanitize graph-level attributes (e.g. nx.condensation adds 'mapping')
+        for k, v in list(G.graph.items()):
+            if isinstance(v, (set, frozenset)):
+                G.graph[k] = ",".join(sorted(str(x) for x in v))
+            elif isinstance(v, (dict, list)):
+                del G.graph[k]  # drop complex graph attrs unsupported by GraphML
+            elif not isinstance(v, (str, int, float, bool)):
+                G.graph[k] = str(v)
         nx.write_graphml(G, str(path))
         logger.info(f"  ✓ Saved: {path}")
 
@@ -373,6 +397,58 @@ class IterativeDomainSynthesizer:
                         for fr in failure_results
                     ],
                 )
+
+                # ── Re-query mutex groups if new predicates appeared ──
+                if self._mutex_groups:
+                    current_preds = {p.name for p in self.domain.predicates}
+                    new_preds = current_preds - self._mutex_pred_snapshot
+                    if new_preds:
+                        logger.info(
+                            "  New predicates detected (%s) — "
+                            "re-querying mutex groups …",
+                            ", ".join(sorted(new_preds)),
+                        )
+                        try:
+                            from ..pruning.llm_axiom import generate_mutex_groups
+                            pred_sigs = []
+                            for pred in self.domain.predicates:
+                                sig_parts = [pred.name] + [
+                                    p.name for p in pred.parameters
+                                ]
+                                pred_sigs.append(" ".join(sig_parts))
+                            groups, pw_rules = generate_mutex_groups(
+                                pred_sigs,
+                                llm_fn=self.llm_fn,
+                                valid_predicate_names=current_preds,
+                            )
+                            self._mutex_groups = groups
+                            self._mutex_pairwise_rules = pw_rules
+                            self._mutex_pred_snapshot = current_preds
+                            logger.info(
+                                "  Updated: %d mutex groups, %d pairwise rules",
+                                len(groups), len(pw_rules),
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "  Mutex group re-query failed: %s", exc
+                            )
+
+                # ── Patch operator effects with mutex groups ──
+                if self._mutex_groups:
+                    from ..pruning.llm_axiom import patch_operator_effects
+                    patched_count = 0
+                    for i, action in enumerate(self.domain.actions):
+                        patched = patch_operator_effects(
+                            action, self._mutex_groups, self.domain,
+                        )
+                        if patched is not action:
+                            self.domain.actions[i] = patched
+                            patched_count += 1
+                    if patched_count:
+                        logger.info(
+                            "  Patched %d actions with mutex group deletes",
+                            patched_count,
+                        )
             else:
                 logger.info("[Step 1] No new actions — skipping hallucination")
 
@@ -387,6 +463,35 @@ class IterativeDomainSynthesizer:
             abstract_graph = enumerate_abstract_states(
                 action_fodds, manager, self.domain
             )
+
+            # ── R5: LLM-based mutex pruning (optional) ──
+            if self.enable_mutex_pruning:
+                from ..pruning.llm_axiom import (
+                    generate_mutex_rules,
+                    prune_with_mutexes,
+                    rules_to_dict,
+                )
+                pred_names = [p.name for p in self.domain.predicates]
+                mutex_rules = generate_mutex_rules(
+                    pred_names, llm_fn=self.llm_fn,
+                )
+                mutex_result = prune_with_mutexes(abstract_graph, mutex_rules)
+                logger.info(
+                    f"  R5 mutex pruning: {mutex_result.original_count} → "
+                    f"{abstract_graph.number_of_nodes()} states "
+                    f"(-{mutex_result.pruned_count} pruned by "
+                    f"{len(mutex_rules)} rules)"
+                )
+                self._save_json(
+                    f"iter{iteration}_step2_mutex_rules.json",
+                    {
+                        "rules": rules_to_dict(mutex_rules),
+                        "pruned_states": mutex_result.pruned_states,
+                        "original_count": mutex_result.original_count,
+                        "pruned_count": mutex_result.pruned_count,
+                    },
+                )
+
             self.abstract_graph = abstract_graph
             timings[f"iter{iteration}_step2"] = time.time() - t0
 
@@ -517,6 +622,7 @@ class IterativeDomainSynthesizer:
                 self.domain,
                 llm_fn=self.llm_fn,
                 config=self.scoring_config,
+                mutex_groups=self._mutex_groups or None,
             )
             self.delta_result = delta_result
             timings[f"iter{iteration}_step5"] = time.time() - t0
@@ -536,6 +642,8 @@ class IterativeDomainSynthesizer:
                         "name": op.name,
                         "sink_scc": op.sink_scc,
                         "source_scc": op.source_scc,
+                        "sink_node": op.sink_node,
+                        "source_node": op.source_node,
                         "delta": op.delta,
                         "nominal_add": [list(t) for t in op.nominal_add],
                         "nominal_del": [list(t) for t in op.nominal_del],
@@ -548,6 +656,24 @@ class IterativeDomainSynthesizer:
             self._save_json(
                 f"iter{iteration}_step5_stats.json", delta_result.stats,
             )
+
+            # Save the augmented graph for visualization/verification
+            if delta_result.augmented_graph is not None:
+                aug_path = self._ensure_dir() / f"iter{iteration}_step5_augmented_graph.graphml"
+                G = delta_result.augmented_graph.copy()
+                # Sanitize ALL node/edge attributes for GraphML
+                # (AbstractState, sets, dicts, etc. must become strings)
+                _basic = (str, int, float, bool)
+                for n in G.nodes():
+                    for k, v in list(G.nodes[n].items()):
+                        if not isinstance(v, _basic):
+                            G.nodes[n][k] = str(v)
+                for u, v, d in G.edges(data=True):
+                    for k, val in list(d.items()):
+                        if not isinstance(val, _basic):
+                            d[k] = str(val)
+                nx.write_graphml(G, str(aug_path))
+                logger.info(f"  Saved augmented graph to {aug_path.name}")
 
             # If already irreducible after Step 5, we can stop early
             if delta_result.is_irreducible:

@@ -10,6 +10,7 @@ setup(
         "scipy",
         "networkx",
         "pyvis",
+        "pyyaml",
     ],
     extras_require={
         "z3": ["z3-solver"],
