@@ -383,7 +383,9 @@ def run_pipeline(
     logger.info(f"  Converged: {summary['converged']}")
     logger.info(f"  Iterations: {summary['iterations']}")
     if summary['spectral_distances']:
-        logger.info(f"  Final Δ_spectral: {summary['spectral_distances'][-1]:.6f}")
+        logger.info(f"  Final Δ_cos: {summary['spectral_distances'][-1]:.6f}")
+    if summary.get('spectral_distances_l2'):
+        logger.info(f"  Final Δ_L2: {summary['spectral_distances_l2'][-1]:.4f}")
 
     # ────────────────────────────────────────────────────────────────
     # Visualization: generate interactive evolution HTML
@@ -525,6 +527,11 @@ def main():
         type=int, default=None,
         help="Maximum iterations for the Steps 1-5 convergence loop.",
     )
+    params_group.add_argument(
+        "--max-recovery-per-iter",
+        type=int, default=None,
+        help="Max recovery operators per outer-loop iteration (budget cap for Step 5).",
+    )
 
     # ── Reward parameter overrides ──
     reward_group = parser.add_argument_group(
@@ -564,6 +571,7 @@ def main():
         "enable_mutex_pruning": args.enable_mutex_pruning,
         "epsilon": args.epsilon,
         "max_loop_iterations": args.max_loop_iterations,
+        "max_recovery_per_iter": args.max_recovery_per_iter,
         "failure_prob": args.failure_prob,
         "scoring_alpha": args.scoring_alpha,
         "scoring_beta": args.scoring_beta,

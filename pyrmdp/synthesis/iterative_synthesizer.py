@@ -9,13 +9,20 @@ repeatedly:
   4. Compute MSCA bound (sources / sinks)                  (Step 4)
   5. Synthesize recovery operators bridging sink→source     (Step 5)
 
-The loop terminates when the **spectral distance** between consecutive
-transition-matrix eigenvalue spectra falls below ε:
+The loop terminates when the **cosine spectral distance** between
+consecutive transition-matrix eigenvalue spectra falls below ε:
 
-    Δ_spectral  =  ‖Λ_current − Λ_prev‖₂  <  ε
+    Δ_cos  =  1 − cos(Λ_current, Λ_prev)  <  ε
 
-Because the matrix dimension can grow across iterations, the shorter
-eigenvalue array is zero-padded before the norm is computed.
+Cosine distance is **dimension-invariant**: proportional growth of the
+abstract state-space (which adds eigenvalue-1 entries for new absorbing
+states) does not inflate the metric the way raw L₂ would.
+
+The ``max_recovery_per_iter`` budget cap (set via ``ScoringConfig``)
+limits how many recovery operators Step 5 can emit per outer-loop
+iteration.  With budget = 1, the loop adds one operator at a time,
+spreading the repair across many iterations and producing the
+multi-iteration spectral-convergence curves needed for the paper.
 
 After the loop converges (or hits ``max_iterations``), Step 6 emits
 multi-policy PPDDL.
@@ -23,7 +30,7 @@ multi-policy PPDDL.
 Usage
 -----
 >>> from pyrmdp.synthesis.iterative_synthesizer import IterativeDomainSynthesizer
->>> synth = IterativeDomainSynthesizer(domain, epsilon=0.05, max_iterations=10)
+>>> synth = IterativeDomainSynthesizer(domain, epsilon=0.02, max_iterations=10)
 >>> ppddl_str = synth.run()
 """
 
@@ -39,6 +46,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import networkx as nx
 import numpy as np
 from scipy.linalg import eigvals
+from scipy.stats import wasserstein_distance as _wasserstein_1d
 
 # Internal pipeline modules
 from .llm_failure import hallucinate_failures, FailureHallucinationResult
@@ -120,22 +128,69 @@ def compute_sorted_eigenvalues(M: np.ndarray) -> np.ndarray:
     return np.array(sorted(np.abs(eigs), reverse=True))
 
 
+def _zero_pad(a: np.ndarray, b: np.ndarray):
+    """Return zero-padded copies of *a* and *b* with equal length."""
+    max_len = max(len(a), len(b))
+    pa, pb = np.zeros(max_len), np.zeros(max_len)
+    pa[: len(a)] = a
+    pb[: len(b)] = b
+    return pa, pb
+
+
 def spectral_distance(
     current: np.ndarray,
     previous: np.ndarray,
 ) -> float:
     """
-    L₂ norm of the difference between two eigenvalue spectra.
+    Cosine distance between two eigenvalue spectra.
 
-    The shorter array is **zero-padded** at the tail so that both
-    arrays have the same length before subtracting.
+    Returns ``1 − cos(Λ_curr, Λ_prev)`` after zero-padding the shorter
+    array.  Cosine distance is **dimension-invariant**: proportional
+    growth of the state-space (which adds eigenvalue-1 entries for new
+    absorbing states) does not inflate the metric the way raw L₂ does.
+
+    Range: [0, 2].  0 = identical spectral shape.
     """
-    max_len = max(len(current), len(previous))
-    padded_curr = np.zeros(max_len)
-    padded_prev = np.zeros(max_len)
-    padded_curr[: len(current)] = current
-    padded_prev[: len(previous)] = previous
-    return float(np.linalg.norm(padded_curr - padded_prev))
+    pa, pb = _zero_pad(current, previous)
+    na, nb = np.linalg.norm(pa), np.linalg.norm(pb)
+    if na == 0 or nb == 0:
+        return 0.0 if (na == 0 and nb == 0) else 1.0
+    cos_sim = float(np.clip(np.dot(pa, pb) / (na * nb), -1.0, 1.0))
+    return 1.0 - cos_sim
+
+
+def spectral_distance_l2(
+    current: np.ndarray,
+    previous: np.ndarray,
+) -> float:
+    """
+    Raw L₂ norm between two zero-padded eigenvalue spectra.
+
+    Kept for backward compatibility and logging; **not** recommended
+    as a convergence criterion because it is dominated by state-space
+    dimension growth rather than structural change.
+    """
+    pa, pb = _zero_pad(current, previous)
+    return float(np.linalg.norm(pa - pb))
+
+
+def spectral_distance_wasserstein(
+    current: np.ndarray,
+    previous: np.ndarray,
+) -> float:
+    """
+    1-D Wasserstein (Earth Mover's) distance between two eigenvalue spectra.
+
+    Uses ``scipy.stats.wasserstein_distance`` which treats each sorted
+    eigenvalue array as an empirical distribution and computes the optimal
+    transport cost.  **No zero-padding** is needed — the function handles
+    arrays of different lengths natively by treating them as discrete
+    distributions with uniform weights.
+
+    This metric captures the *transport cost* of reshaping one spectrum
+    into the other and is robust to dimension growth.
+    """
+    return float(_wasserstein_1d(current, previous))
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -154,6 +209,8 @@ class IterationRecord:
     num_sinks: int = 0
     msca_bound: int = 0
     spectral_distance: Optional[float] = None
+    spectral_distance_l2: Optional[float] = None
+    spectral_distance_wasserstein: Optional[float] = None
     eigenvalues: Optional[List[float]] = None
     step1_actions_processed: int = 0
     step5_operators_synthesized: int = 0
@@ -177,7 +234,7 @@ class IterativeDomainSynthesizer:
         The pyPPDDL Domain object (from Step 0 or loaded from file).
         **Mutated in place** as new predicates/types/actions are added.
     epsilon : float
-        Convergence threshold for spectral distance (default 0.05).
+        Convergence threshold for cosine spectral distance (default 0.02).
     max_iterations : int
         Hard cap on loop iterations (default 10).
     failure_prob : float
@@ -206,7 +263,7 @@ class IterativeDomainSynthesizer:
         self,
         domain: Domain,
         *,
-        epsilon: float = 0.05,
+        epsilon: float = 0.02,
         max_iterations: int = 10,
         failure_prob: float = 0.1,
         scoring_config: Optional[ScoringConfig] = None,
@@ -325,6 +382,15 @@ class IterativeDomainSynthesizer:
         str
             The final PPDDL domain string.
         """
+        # ── Clean stale iter* artefacts from previous runs ──
+        out = self._ensure_dir()
+        for stale in out.glob("iter*"):
+            stale.unlink(missing_ok=True)
+        for stale in out.glob("robustified.ppddl"):
+            stale.unlink(missing_ok=True)
+        for stale in out.glob("pipeline_summary.json"):
+            stale.unlink(missing_ok=True)
+
         logger.info("═" * 60)
         logger.info("Iterative Domain Robustification Loop  (Steps 1 → 5)")
         logger.info(
@@ -352,6 +418,9 @@ class IterativeDomainSynthesizer:
             logger.info(f"──── Iteration {iteration} ────")
 
             # ── Step 1: Failure Hallucination (new operators only) ──
+            # Frontier-Only Policy: each operator (base or recovery) is
+            # hallucinated exactly once, in the iteration it first appears.
+            # `known_action_names` prevents re-processing.
             new_actions = [
                 a for a in self.domain.actions
                 if a.name not in known_action_names
@@ -359,15 +428,19 @@ class IterativeDomainSynthesizer:
             known_action_names.update(a.name for a in self.domain.actions)
 
             if new_actions:
+                n_base = sum(1 for a in new_actions if not a.name.startswith("recover_"))
+                n_recov = len(new_actions) - n_base
                 logger.info(
                     f"[Step 1] Failure Hallucination  "
-                    f"({len(new_actions)} new actions)"
+                    f"({len(new_actions)} new actions: "
+                    f"{n_base} base, {n_recov} recovery)"
                 )
                 t0 = time.time()
                 self.domain, failure_results = hallucinate_failures(
                     self.domain,
                     llm_fn=self.llm_fn,
                     failure_prob=self.failure_prob,
+                    action_names={a.name for a in new_actions},
                 )
                 timings[f"iter{iteration}_step1"] = time.time() - t0
 
@@ -528,19 +601,28 @@ class IterativeDomainSynthesizer:
             eigenvalues = compute_sorted_eigenvalues(M_abs)
             rec.eigenvalues = eigenvalues.tolist()
 
-            # ── Stopping Criterion: Spectral Distance ──
+            # ── Stopping Criterion: Spectral Distance (Wasserstein) ──
             if self._prev_eigenvalues.size > 0:
-                delta_spectral = spectral_distance(
+                delta_cos = spectral_distance(
                     eigenvalues, self._prev_eigenvalues,
                 )
-                rec.spectral_distance = delta_spectral
+                delta_l2 = spectral_distance_l2(
+                    eigenvalues, self._prev_eigenvalues,
+                )
+                delta_w = spectral_distance_wasserstein(
+                    eigenvalues, self._prev_eigenvalues,
+                )
+                rec.spectral_distance = delta_cos
+                rec.spectral_distance_l2 = delta_l2
+                rec.spectral_distance_wasserstein = delta_w
                 logger.info(
-                    f"  Spectral distance: Δ = {delta_spectral:.6f}  "
-                    f"(ε = {self.epsilon})"
+                    f"  Spectral distance: Δ_W = {delta_w:.6f}  "
+                    f"(ε = {self.epsilon}), Δ_cos = {delta_cos:.6f}, "
+                    f"Δ_L2 = {delta_l2:.4f}"
                 )
 
-                if delta_spectral < self.epsilon:
-                    logger.info("  ✓ Spectral Convergence Reached.")
+                if delta_w < self.epsilon:
+                    logger.info("  ✓ Spectral Convergence Reached (Wasserstein).")
                     rec.elapsed = time.time() - iter_start
                     self.converged = True
                     self.history.append(rec)
@@ -607,12 +689,11 @@ class IterativeDomainSynthesizer:
             )
 
             if aug_bound.is_already_irreducible:
-                logger.info("  Graph is already irreducible!")
+                logger.info("  Graph is already irreducible — skipping Step 5")
                 rec.step5_is_irreducible = True
                 rec.elapsed = time.time() - iter_start
-                self.converged = True
                 self.history.append(rec)
-                break
+                continue
 
             # ── Step 5: Delta Minimization & Synthesis ──
             logger.info("[Step 5] Delta Minimization & Synthesis")
@@ -620,7 +701,6 @@ class IterativeDomainSynthesizer:
             delta_result = delta_minimize(
                 abstract_graph,
                 self.domain,
-                llm_fn=self.llm_fn,
                 config=self.scoring_config,
                 mutex_groups=self._mutex_groups or None,
             )
@@ -645,10 +725,13 @@ class IterativeDomainSynthesizer:
                         "sink_node": op.sink_node,
                         "source_node": op.source_node,
                         "delta": op.delta,
+                        "parameters": [
+                            {"name": p.name, "type": p.type}
+                            for p in op.parameters
+                        ],
+                        "precondition_atoms": [list(t) for t in op.precondition_atoms],
                         "nominal_add": [list(t) for t in op.nominal_add],
                         "nominal_del": [list(t) for t in op.nominal_del],
-                        "failure_add": [list(t) for t in op.failure_add],
-                        "failure_del": [list(t) for t in op.failure_del],
                     }
                     for op in delta_result.operators
                 ],
@@ -675,13 +758,8 @@ class IterativeDomainSynthesizer:
                 nx.write_graphml(G, str(aug_path))
                 logger.info(f"  Saved augmented graph to {aug_path.name}")
 
-            # If already irreducible after Step 5, we can stop early
             if delta_result.is_irreducible:
                 logger.info("  Graph is now irreducible after Step 5.")
-                rec.elapsed = time.time() - iter_start
-                self.converged = True
-                self.history.append(rec)
-                break
 
             rec.elapsed = time.time() - iter_start
             self.history.append(rec)
@@ -742,10 +820,21 @@ class IterativeDomainSynthesizer:
             "epsilon": self.epsilon,
             "max_iterations": self.max_iterations,
             "total_actions": len(self.domain.actions),
+            "spectral_metric": "wasserstein",
             "spectral_distances": [
                 r.spectral_distance
                 for r in self.history
                 if r.spectral_distance is not None
+            ],
+            "spectral_distances_l2": [
+                r.spectral_distance_l2
+                for r in self.history
+                if r.spectral_distance_l2 is not None
+            ],
+            "spectral_distances_wasserstein": [
+                r.spectral_distance_wasserstein
+                for r in self.history
+                if r.spectral_distance_wasserstein is not None
             ],
             "msca_bounds": [
                 r.msca_bound
@@ -758,12 +847,17 @@ class IterativeDomainSynthesizer:
                     "states": r.num_states,
                     "edges": r.num_edges,
                     "sccs": r.num_sccs,
+                    "is_strongly_connected": r.is_strongly_connected,
                     "sources": r.num_sources,
                     "sinks": r.num_sinks,
                     "msca_bound": r.msca_bound,
                     "spectral_distance": r.spectral_distance,
+                    "spectral_distance_l2": r.spectral_distance_l2,
+                    "spectral_distance_wasserstein": r.spectral_distance_wasserstein,
+                    "eigenvalues": r.eigenvalues,
                     "step1_actions": r.step1_actions_processed,
                     "step5_operators": r.step5_operators_synthesized,
+                    "step5_is_irreducible": r.step5_is_irreducible,
                     "elapsed_s": round(r.elapsed, 2),
                 }
                 for r in self.history

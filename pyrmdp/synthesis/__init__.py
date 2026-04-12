@@ -38,6 +38,8 @@ from .iterative_synthesizer import (
     extract_transition_matrix,
     compute_sorted_eigenvalues,
     spectral_distance,
+    spectral_distance_l2,
+    spectral_distance_wasserstein,
 )
 from .ppddl_emitter import emit_ppddl
 
@@ -64,5 +66,7 @@ __all__ = [
     "extract_transition_matrix",
     "compute_sorted_eigenvalues",
     "spectral_distance",
+    "spectral_distance_l2",
+    "spectral_distance_wasserstein",
     "emit_ppddl",
 ]

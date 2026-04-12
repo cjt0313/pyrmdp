@@ -56,11 +56,12 @@ def _run_one_case(args: Tuple) -> Dict:
     Execute the pipeline for a single test case.
 
     Parameters are packed into a tuple for use with Pool.map():
-        (case_dir, num_policies, output_name, verbose)
+        (case_dir, num_policies, output_name, verbose,
+         max_recovery_per_iter, max_loop_iterations, epsilon)
 
     Returns a result dict with status, timing, and any error info.
     """
-    case_dir, num_policies, output_name, verbose = args
+    case_dir, num_policies, output_name, verbose, max_recovery_per_iter, max_loop_iterations, epsilon = args
     case_dir = Path(case_dir)
     case_id = case_dir.name
 
@@ -122,12 +123,17 @@ def _run_one_case(args: Tuple) -> Dict:
         from pyrmdp.synthesis.config import PipelineConfig
         from run_pipeline import run_pipeline
 
-        cfg = PipelineConfig(
+        cfg_kwargs = dict(
             num_robot_policies=num_policies,
             output_dir=str(out_dir),
             save_intermediates=True,
             visualize=True,
+            max_recovery_per_iter=max_recovery_per_iter,
+            max_loop_iterations=max_loop_iterations,
         )
+        if epsilon is not None:
+            cfg_kwargs["epsilon"] = epsilon
+        cfg = PipelineConfig(**cfg_kwargs)
 
         ppddl = run_pipeline(
             image_paths=[str(image_path)],
@@ -242,6 +248,21 @@ def main():
         help="Print what would be executed without running.",
     )
     parser.add_argument(
+        "--max-recovery-per-iter",
+        type=int, default=None,
+        help="Max recovery operators per iteration (budget cap for Step 5). Default: unlimited.",
+    )
+    parser.add_argument(
+        "--epsilon",
+        type=float, default=None,
+        help="Wasserstein spectral-distance convergence threshold (default: use config default 0.1).",
+    )
+    parser.add_argument(
+        "--max-loop-iterations",
+        type=int, default=10,
+        help="Max outer loop iterations (default: 10).",
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable DEBUG logging in worker processes.",
@@ -280,7 +301,8 @@ def main():
 
     # ── Build worker args ──
     worker_args = [
-        (str(c), args.num_policies, args.output_name, args.verbose)
+        (str(c), args.num_policies, args.output_name, args.verbose,
+         args.max_recovery_per_iter, args.max_loop_iterations, args.epsilon)
         for c in cases
     ]
 

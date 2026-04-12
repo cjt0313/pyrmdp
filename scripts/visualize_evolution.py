@@ -83,12 +83,25 @@ def load_pipeline_data(output_dir: Path) -> dict:
             data["origins"] = json.load(f)
 
     # Merge Step 1 hallucinated predicates/types from failures (fallback)
+    # Also build per-iteration hallucination audit for the visualization.
     origins = data.get("origins", {"types": {}, "predicates": {}})
+    hallucination_audit: list[dict] = []  # [{iter, base_actions, recovery_actions}]
     for fpath in sorted(output_dir.glob("iter*_step1_failures.json")):
         try:
             with open(fpath) as f:
                 fail_data = json.load(f)
             items = fail_data if isinstance(fail_data, list) else fail_data.get("failures", [])
+            # Extract iteration number from filename
+            import re as _re
+            m = _re.search(r"iter(\d+)_", fpath.name)
+            iter_num = int(m.group(1)) if m else 0
+            base_actions = [fi["action"] for fi in items if not fi["action"].startswith("recover_")]
+            recovery_actions = [fi["action"] for fi in items if fi["action"].startswith("recover_")]
+            hallucination_audit.append({
+                "iteration": iter_num,
+                "base_actions": base_actions,
+                "recovery_actions": recovery_actions,
+            })
             for fi in items:
                 for np in fi.get("new_predicates", []):
                     if np not in origins.get("predicates", {}):
@@ -102,6 +115,7 @@ def load_pipeline_data(output_dir: Path) -> dict:
         except Exception:
             pass
     data["origins"] = origins
+    data["hallucination_audit"] = hallucination_audit
 
     return data
 
@@ -214,8 +228,10 @@ def _pretty_print_action(block: str) -> str:
     # Strip policy suffix from the action name
     flat = _re.sub(r'\(:action\s+([\w-]+?)_(robot\d+|human)',
                    r'(:action \1', flat)
-    # Remove (increase (reward) ...) terms
-    flat = _re.sub(r'\(\s*increase\s+\(\s*reward\s*\)\s+[^)]*\)', '', flat)
+    # Remove reward/cost annotation terms
+    flat = _re.sub(r'\(\s*(?:increase|decrease)\s+\(\s*reward\s*\)\s+[^)]*\)', '', flat)
+    # Clean up empty (and) blocks left after reward removal
+    flat = _re.sub(r'\(\s*and\s*\)', '', flat)
     # Clean up any double spaces left behind
     flat = _re.sub(r'  +', ' ', flat)
 
@@ -285,7 +301,8 @@ def _pretty_print_action(block: str) -> str:
                         result.append(INDENT * (base_depth + 1) + num + " " + child)
                         j = end + 1
                     else:
-                        result.append(INDENT * (base_depth + 1) + num)
+                        # Effect was stripped (e.g. reward-only branch) → show no-op
+                        result.append(INDENT * (base_depth + 1) + num + " ()")
                 else:
                     j += 1
             result.append(INDENT * base_depth + ")")
@@ -535,7 +552,8 @@ def generate_html(data: dict) -> str:
     augmentation = data.get("augmentation", {})
     failures = data.get("failures", [])
     origins = data.get("origins", {"types": {}, "predicates": {}})
-
+    summary = data.get("summary", {})
+    hallucination_audit = data.get("hallucination_audit", [])
     label_map = build_state_label_map(states)
     scc_map = build_scc_map(condensation)
 
@@ -619,6 +637,32 @@ def generate_html(data: dict) -> str:
             from_node = sink_members[0] if sink_members else f"SCC-{sink_scc}"
             to_node = source_members[0] if source_members else f"SCC-{source_scc}"
 
+        # Format atoms as readable strings: ["holding", "?r", "?x"] -> "holding(?r, ?x)"
+        def fmt_atoms(atoms):
+            parts = []
+            for a in atoms:
+                if isinstance(a, (list, tuple)) and len(a) > 1:
+                    parts.append(f"{a[0]}({', '.join(a[1:])})")
+                elif isinstance(a, (list, tuple)):
+                    parts.append(a[0] if a else "?")
+                else:
+                    parts.append(str(a))
+            return parts
+
+        def fmt_params(params):
+            parts = []
+            for p in params:
+                if isinstance(p, dict):
+                    parts.append(f"{p.get('name','?')} - {p.get('type','?')}")
+                else:
+                    parts.append(str(p))
+            return ", ".join(parts)
+
+        adds = fmt_atoms(op.get('nominal_add', []))
+        dels = fmt_atoms(op.get('nominal_del', []))
+        preconds = fmt_atoms(op.get('precondition_atoms', []))
+        params = fmt_params(op.get('parameters', []))
+
         recovery_edges_js.append({
             "from": from_node,
             "to": to_node,
@@ -626,8 +670,10 @@ def generate_html(data: dict) -> str:
             "title": (
                 f"<b>Recovery #{i+1}:</b> {op['name']}<br>"
                 f"Δ={op['delta']} | {from_node} → {to_node}<br>"
-                f"Adds: {op.get('nominal_add', [])}<br>"
-                f"Dels: {op.get('nominal_del', [])}"
+                f"Params: ({params})<br>"
+                f"Pre: {', '.join(preconds) if preconds else '(none)'}<br>"
+                f"Add: {', '.join(adds) if adds else '(none)'}<br>"
+                f"Del: {', '.join(dels) if dels else '(none)'}"
             ),
             "delta": op["delta"],
             "iteration": i + 1,
@@ -734,6 +780,172 @@ def generate_html(data: dict) -> str:
         f'</div>'
       )
     operators_html = "\n".join(operators_html_parts)
+
+    # ── Panel 1: Abstract-states-per-iteration bar chart (inline SVG) ──
+    per_iter = summary.get("per_iteration", [])
+    states_chart_html = ""
+    if per_iter:
+        iter_labels = [str(it["iteration"]) for it in per_iter]
+        state_counts = [it["states"] for it in per_iter]
+        edge_counts = [it["edges"] for it in per_iter]
+        max_val = max(max(state_counts), max(edge_counts), 1)
+        n = len(per_iter)
+        bar_w = max(24, min(44, 260 // max(n, 1)))
+        gap = 6
+        svg_w = n * (bar_w + gap) + 50  # extra for y-axis label
+        svg_h = 130
+        chart_h = 90
+        x_off = 32  # left margin for axis labels
+
+        bars = []
+        for i, (sc, ec) in enumerate(zip(state_counts, edge_counts)):
+            x = x_off + i * (bar_w + gap)
+            sh = max(2, sc / max_val * chart_h)
+            eh = max(2, ec / max_val * chart_h)
+            y_s = chart_h - sh
+            y_e = chart_h - eh
+            # Edges bar (behind, narrower)
+            bars.append(
+                f'<rect x="{x + bar_w * 0.15}" y="{y_e}" width="{bar_w * 0.7}" '
+                f'height="{eh}" rx="2" fill="#30363d" opacity="0.7"/>'
+            )
+            # States bar (front)
+            bars.append(
+                f'<rect x="{x}" y="{y_s}" width="{bar_w}" height="{sh}" rx="3" '
+                f'fill="#58a6ff" opacity="0.85"/>'
+            )
+            # Value label on top of states bar
+            bars.append(
+                f'<text x="{x + bar_w / 2}" y="{y_s - 3}" '
+                f'text-anchor="middle" fill="#c9d1d9" font-size="10" font-weight="600">{sc}</text>'
+            )
+            # Iteration label
+            bars.append(
+                f'<text x="{x + bar_w / 2}" y="{chart_h + 14}" '
+                f'text-anchor="middle" fill="#8b949e" font-size="10">It {iter_labels[i]}</text>'
+            )
+
+        # Y-axis ticks
+        y_ticks = ""
+        for frac in [0, 0.5, 1.0]:
+            y = chart_h * (1 - frac)
+            val = int(max_val * frac)
+            y_ticks += (
+                f'<text x="{x_off - 4}" y="{y + 3}" text-anchor="end" '
+                f'fill="#484f58" font-size="9">{val}</text>'
+                f'<line x1="{x_off}" y1="{y}" x2="{svg_w}" y2="{y}" '
+                f'stroke="#21262d" stroke-width="0.5"/>'
+            )
+
+        states_chart_svg = (
+            f'<svg width="100%" viewBox="0 0 {svg_w} {svg_h}" '
+            f'preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg">'
+            f'{y_ticks}{"".join(bars)}'
+            f'</svg>'
+        )
+        # Legend below chart
+        legend = (
+            '<div style="display:flex;gap:14px;margin-top:4px;font-size:10px;color:#8b949e;">'
+            '<span><span style="display:inline-block;width:8px;height:8px;border-radius:2px;'
+            'background:#58a6ff;margin-right:3px;"></span>States</span>'
+            '<span><span style="display:inline-block;width:8px;height:8px;border-radius:2px;'
+            'background:#30363d;margin-right:3px;"></span>Edges</span>'
+            '</div>'
+        )
+        converged = summary.get("converged", False)
+        conv_metric = summary.get("spectral_metric", "wasserstein")
+        epsilon = summary.get("epsilon", "?")
+        conv_badge = (
+            f'<div style="margin-top:6px;font-size:11px;">'
+            f'<span style="color:{("#238636" if converged else "#da3633")};">'
+            f'{"✓ Converged" if converged else "✗ Not converged"}</span>'
+            f' in <b>{len(per_iter)}</b> iterations'
+            f' (ε={epsilon}, {conv_metric})</div>'
+        )
+        states_chart_html = states_chart_svg + legend + conv_badge
+
+    # ── Panel 2: Recovery Hallucination Audit ──
+    # Frontier-Only Policy audit: each operator should be hallucinated
+    # exactly once.  Violations = base ops re-appearing in iter 2+, or
+    # recovery ops appearing in the same iteration as base ops that were
+    # already processed.
+    audit_html_parts = []
+    seen_actions: set = set()
+    any_violation = False
+    total_base = 0
+    total_recovery = 0
+
+    if hallucination_audit:
+        for entry in hallucination_audit:
+            it = entry["iteration"]
+            base = entry["base_actions"]
+            recov = entry["recovery_actions"]
+            total_base += len(base)
+            total_recovery += len(recov)
+
+            # Check for violations: any action already processed before?
+            violations = [a for a in base + recov if a in seen_actions]
+            if violations:
+                any_violation = True
+            seen_actions.update(base + recov)
+
+            # Base actions
+            base_html = ", ".join(
+                f'<span class="audit-action audit-base">{html_mod.escape(a)}</span>'
+                for a in base
+            ) if base else '<span style="color:#484f58;font-size:11px;">—</span>'
+
+            # Recovery actions — styled differently: expected in iter 2+
+            if recov:
+                recov_html = ", ".join(
+                    f'<span class="audit-action audit-recovery-ok">{html_mod.escape(a)}</span>'
+                    for a in recov
+                )
+            else:
+                recov_html = '<span style="color:#484f58;font-size:11px;">—</span>'
+
+            # Violation display
+            violation_html = ""
+            if violations:
+                violation_html = (
+                    '<div style="color:#f85149;font-size:10px;margin-top:2px;">'
+                    '⚠ Re-hallucinated: ' +
+                    ", ".join(f'<b>{html_mod.escape(a)}</b>' for a in violations) +
+                    '</div>'
+                )
+
+            audit_html_parts.append(
+                f'<div class="audit-row">'
+                f'<div class="audit-iter">Iter {it}</div>'
+                f'<div class="audit-detail">'
+                f'<div style="margin-bottom:3px;"><b style="color:#58a6ff;">Base ({len(base)}):</b> {base_html}</div>'
+                f'<div><b style="color:#f0883e;">Recovery ({len(recov)}):</b> {recov_html}</div>'
+                f'{violation_html}'
+                f'</div>'
+                f'</div>'
+            )
+    else:
+        audit_html_parts.append(
+            '<div style="font-size:11px;color:#484f58;">No hallucination data available.</div>'
+        )
+
+    # Overall verdict
+    if hallucination_audit and not any_violation:
+        verdict = (
+            '<div class="audit-verdict audit-verdict-ok">'
+            f'✓ Frontier-Only Policy OK — {total_base} base + {total_recovery} recovery, '
+            f'each hallucinated exactly once'
+            '</div>'
+        )
+    elif any_violation:
+        verdict = (
+            '<div class="audit-verdict audit-verdict-bad">'
+            '⚠ Frontier-Only Policy VIOLATED — operators re-hallucinated'
+            '</div>'
+        )
+    else:
+        verdict = ''
+    audit_html = verdict + "\n".join(audit_html_parts)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -905,6 +1117,76 @@ def generate_html(data: dict) -> str:
     font-weight: 700;
     min-width: 30px;
     text-align: right;
+  }}
+
+  /* ── Iteration chart panel ── */
+  .iter-chart-panel svg {{
+    display: block;
+    margin: 0 auto;
+  }}
+
+  /* ── Hallucination audit panel ── */
+  .audit-row {{
+    display: flex;
+    gap: 8px;
+    padding: 6px 0;
+    border-bottom: 1px solid #21262d;
+    font-size: 12px;
+  }}
+  .audit-row:last-child {{ border-bottom: none; }}
+  .audit-iter {{
+    min-width: 42px;
+    font-weight: 700;
+    color: #8b949e;
+    font-size: 11px;
+    padding-top: 2px;
+  }}
+  .audit-detail {{
+    flex: 1;
+    line-height: 1.5;
+  }}
+  .audit-action {{
+    display: inline-block;
+    font-size: 10px;
+    font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    border-radius: 3px;
+    padding: 1px 5px;
+    margin: 1px 2px;
+  }}
+  .audit-base {{
+    background: #1f3a5f;
+    color: #58a6ff;
+  }}
+  .audit-recovery-ok {{
+    background: #3d2800;
+    color: #f0883e;
+  }}
+  .audit-recovery-bad {{
+    background: #4d1a1a;
+    color: #f85149;
+    border: 1px solid #6e2b2b;
+  }}
+  .audit-ok {{
+    color: #238636;
+    font-size: 11px;
+    font-weight: 600;
+  }}
+  .audit-verdict {{
+    padding: 6px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    margin-bottom: 8px;
+  }}
+  .audit-verdict-ok {{
+    background: #0d2818;
+    color: #7ee787;
+    border: 1px solid #1a4d2e;
+  }}
+  .audit-verdict-bad {{
+    background: #3d1a1a;
+    color: #f85149;
+    border: 1px solid #6e2b2b;
   }}
 
   /* ── Domain info panels ── */
@@ -1196,6 +1478,32 @@ def generate_html(data: dict) -> str:
       </div>
     </div>
 
+    <!-- ── Abstract States per Iteration ── -->
+    <div class="panel">
+      <div class="collapsible-header open" onclick="toggleCollapse(this)">
+        <h3 style="margin-bottom:0">Abstract States / Iteration</h3>
+        <span class="chevron">▶</span>
+      </div>
+      <div class="collapsible-body open">
+        <div class="iter-chart-panel" style="margin-top:8px;">
+          {states_chart_html if states_chart_html else '<div style="font-size:11px;color:#484f58;">No iteration data.</div>'}
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Hallucination Audit ── -->
+    <div class="panel">
+      <div class="collapsible-header open" onclick="toggleCollapse(this)">
+        <h3 style="margin-bottom:0">Step 1 Hallucination Audit</h3>
+        <span class="chevron">▶</span>
+      </div>
+      <div class="collapsible-body open">
+        <div style="margin-top:8px;">
+          {audit_html}
+        </div>
+      </div>
+    </div>
+
     <div class="panel">
       <h3>Edge Legend</h3>
       <div class="legend-item">
@@ -1227,7 +1535,7 @@ def generate_html(data: dict) -> str:
           <div style="width:6px; height:6px; border-radius:50%; background:#f0883e;"></div>
           <div style="width:6px; height:6px; border-radius:50%; background:#da3633;"></div>
         </div>
-        <span>Dashed = failure branch</span>
+        <span>Recovery = deterministic synthesis</span>
       </div>
     </div>
 
@@ -1515,7 +1823,7 @@ function setStep(step) {{
       title: re.title,
       color: {{ color: c, highlight: '#fff', opacity: 0.9 }},
       width: 2.5,
-      dashes: [8, 4],
+      dashes: false,
     }});
     currentStep++;
   }}

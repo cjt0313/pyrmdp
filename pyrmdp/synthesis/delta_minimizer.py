@@ -1,20 +1,27 @@
 """
-Step 5: Delta Minimization & Operator Synthesis
+Step 5: Delta Minimization & Deterministic Recovery Synthesis
 
-Iteratively selects the best (sink → source) SCC pair to bridge,
+Iteratively selects the best (sink -> source) SCC pair to bridge,
 minimizing logical Hamming distance (predicate delta) while maximizing
-topological gain. Queries an LLM to synthesize the bridging PPDDL operator
-plus its failure mode. Repeats until the DAG collapses to a single SCC.
+topological gain.  For each selected pair the recovery operator is
+computed **deterministically** from the predicate delta -- no LLM call.
 
-Scoring: α·(1 − norm_delta) + β·(norm_gain), default α=0.7, β=0.3.
+  * Preconditions: minimal causal subset of the sink state (only
+    predicates sharing a unified variable with the delta effects).
+  * Effects: single deterministic outcome (prob 1.0) that adds/deletes
+    exactly the predicates in the delta.
+  * No failure branch, no numeric rewards -- those are injected later
+    by Step 1 (failure hallucination) and Step 6 (PPDDL emission).
+
+Scoring: alpha*(1 - norm_delta) + beta*(norm_gain), default alpha=0.7, beta=0.3.
 """
 
 from __future__ import annotations
 
 import logging
-import os
+from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import networkx as nx
 
@@ -25,7 +32,6 @@ from .graph_analysis import (
     condense_to_dag,
     get_scc_representative_predicates,
 )
-from .prompts.llm_recovery_prompt import build_recovery_prompt, parse_recovery_response
 
 # pyPPDDL data model
 try:
@@ -56,6 +62,7 @@ class ScoringConfig:
     max_iterations: int = 50        # Max synthesis iterations
     max_candidates_per_iter: int = 10  # Candidates to try per iteration
     delta_threshold: int = 15       # Max predicates LLM can handle
+    max_recovery_per_iter: Optional[int] = None  # Budget cap (None = unlimited)
 
 
 @dataclass
@@ -74,18 +81,23 @@ class CandidateEdge:
 
 @dataclass
 class SynthesizedOperator:
-    """An operator synthesized by the LLM to bridge two SCCs."""
+    """A deterministic recovery operator bridging two SCCs.
+
+    Built purely from the predicate delta between sink and source
+    states — no LLM involved.
+    """
     name: str
     parameters: List[TypedParam]
-    precondition_preds: List[str]
-    nominal_add: List[Tuple]
-    nominal_del: List[Tuple]
-    failure_add: List[Tuple]
-    failure_del: List[Tuple]
-    numeric_effects: List[Tuple]
-    source_scc: int
-    sink_scc: int
-    delta: int
+    precondition_preds: List[str]        # bare predicate names in precondition
+    precondition_atoms: List[Tuple]      # grounded atoms, e.g. ("holding", "?r", "?x")
+    nominal_add: List[Tuple]             # add-effects as grounded tuples
+    nominal_del: List[Tuple]             # del-effects as grounded tuples
+    failure_add: List[Tuple] = field(default_factory=list)   # always empty (Step 1 adds later)
+    failure_del: List[Tuple] = field(default_factory=list)   # always empty
+    numeric_effects: List[Tuple] = field(default_factory=list)  # always empty (Step 6 adds)
+    source_scc: int = 0
+    sink_scc: int = 0
+    delta: int = 0
     sink_node: str = ""
     source_node: str = ""
     action_schema: Optional[ActionSchema] = None
@@ -205,118 +217,167 @@ def mutex_aware_hamming_distance(
 
 
 # ════════════════════════════════════════════════════════════════════
-#  LLM Operator Synthesis
+#  Deterministic Recovery Operator Synthesis
 # ════════════════════════════════════════════════════════════════════
 
-def _build_synthesis_prompt(candidate: CandidateEdge) -> str:
-    """Build the LLM prompt for operator synthesis.
+def _build_pred_lookup(domain: Domain) -> Dict[str, "Predicate"]:
+    """Build ``{predicate_name: Predicate}`` from the domain."""
+    return {p.name: p for p in domain.predicates}
 
-    Delegates to :mod:`prompts.llm_recovery_prompt` and concatenates
-    system + user for the text-only ``llm_fn(prompt) → str`` interface.
+
+def _ground_predicate(
+    pred_name: str,
+    pred_lookup: Dict[str, "Predicate"],
+    var_pool: "OrderedDict[str, str]",
+) -> Tuple:
+    """Ground a bare predicate name into a fully-typed tuple.
+
+    For each parameter slot in the domain predicate signature, reuse an
+    existing variable from *var_pool* if the same ``(name, type)`` was
+    already registered, otherwise mint a fresh ``?v<N>`` variable.
+
+    Returns
+    -------
+    tuple
+        ``(pred_name, var1, var2, ...)`` ready for PPDDL add/del lists.
     """
-    parts = build_recovery_prompt(
-        sink_scc=candidate.sink_scc,
-        source_scc=candidate.source_scc,
-        sink_true_preds=candidate.sink_true_preds,
-        sink_false_preds=candidate.sink_false_preds,
-        source_true_preds=candidate.source_true_preds,
-        source_false_preds=candidate.source_false_preds,
-        delta=candidate.delta,
-    )
-    return parts["system"] + "\n\n" + parts["user"]
+    pred_def = pred_lookup.get(pred_name)
+    if pred_def is None:
+        # Unknown predicate — treat as 0-arity.
+        logger.warning(f"Predicate '{pred_name}' not found in domain; treating as 0-arity")
+        return (pred_name,)
 
-
-def _parse_synthesis_response(
-    response_text: str,
-    candidate: CandidateEdge,
-) -> Optional[SynthesizedOperator]:
-    """Parse the LLM JSON response into a SynthesizedOperator.
-
-    Delegates JSON extraction to :func:`prompts.llm_recovery_prompt.parse_recovery_response`,
-    then converts the raw dict into a :class:`SynthesizedOperator`.
-    """
-    fallback_name = f"recover_{candidate.sink_scc}_to_{candidate.source_scc}"
-    data = parse_recovery_response(response_text, fallback_name=fallback_name)
-    if data is None:
-        return None
-
-    # Build parameters
-    params = [
-        TypedParam(name=p["name"], type=p.get("type", "object"))
-        for p in data.get("parameters", [])
-    ]
-
-    # Build precondition predicate names
-    precond_preds = [
-        p[0] if isinstance(p, list) else p
-        for p in data.get("preconditions", [])
-    ]
-
-    return SynthesizedOperator(
-        name=data.get("name", f"recover_{candidate.sink_scc}_to_{candidate.source_scc}"),
-        parameters=params,
-        precondition_preds=precond_preds,
-        nominal_add=[tuple(p) for p in data.get("nominal_add", [])],
-        nominal_del=[tuple(p) for p in data.get("nominal_del", [])],
-        failure_add=[tuple(p) for p in data.get("failure_add", [])],
-        failure_del=[tuple(p) for p in data.get("failure_del", [])],
-        numeric_effects=[tuple(n) for n in data.get("numeric_effects", [])],
-        source_scc=candidate.source_scc,
-        sink_scc=candidate.sink_scc,
-        delta=candidate.delta,
-    )
+    args: List[str] = []
+    for param in pred_def.parameters:
+        # Reuse an existing variable with the same PDDL name.
+        # Domain predicate signatures already use canonical variable
+        # names (e.g. ?r - robot, ?x - movable) which encode both
+        # the intended role and the type.  Re-using them directly
+        # ensures unification across predicates that share the same
+        # typed slot.
+        var_name = param.name
+        if var_name not in var_pool:
+            var_pool[var_name] = param.type
+        args.append(var_name)
+    return (pred_name, *args)
 
 
 def _synthesize_operator(
     candidate: CandidateEdge,
-    llm_fn: Callable[[str], str],
-) -> Optional[SynthesizedOperator]:
-    """Query the LLM to synthesize a PPDDL operator for a candidate edge."""
-    prompt = _build_synthesis_prompt(candidate)
-    try:
-        response = llm_fn(prompt)
-        return _parse_synthesis_response(response, candidate)
-    except Exception as e:
-        logger.error(f"LLM synthesis failed: {e}")
-        return None
+    domain: Domain,
+) -> SynthesizedOperator:
+    """Deterministically synthesize a recovery operator from the delta.
+
+    Algorithm
+    ---------
+    1. Compute the **delta** between sink and source states:
+       - ``must_add``  = predicates that must become true
+       - ``must_del``  = predicates that must become false
+    2. **Ground** each predicate in the delta using the domain's predicate
+       signatures, building a unified variable pool.
+    3. Compute **minimal causal preconditions**: only sink-true predicates
+       whose grounded form shares ≥ 1 variable with the delta effects.
+    4. Return a :class:`SynthesizedOperator` with no failure branch and
+       no numeric effects.
+    """
+    pred_lookup = _build_pred_lookup(domain)
+
+    # ── 1. Compute the delta ──
+    #  must_add: false (or unknown) in sink, true in source
+    must_add = (
+        (candidate.source_true_preds - candidate.sink_true_preds)
+    )
+    #  must_del: true in sink, false (or unknown) in source
+    must_del = (
+        (candidate.sink_true_preds - candidate.source_true_preds)
+        & (candidate.source_false_preds | (
+            candidate.sink_true_preds - candidate.source_true_preds
+            - candidate.source_false_preds
+        ))
+    )
+    # More precisely: delete anything true in sink that is NOT true in
+    # source.  If it appears explicitly false in source, definitely
+    # delete.  If it is simply absent from source ("don't care"), we
+    # still want the transition to land in source, so we delete.
+    must_del = candidate.sink_true_preds - candidate.source_true_preds
+
+    # ── 2. Ground delta predicates (builds unified var_pool) ──
+    var_pool: OrderedDict[str, str] = OrderedDict()  # var_name → type
+
+    add_atoms: List[Tuple] = []
+    for pname in sorted(must_add):
+        add_atoms.append(_ground_predicate(pname, pred_lookup, var_pool))
+
+    del_atoms: List[Tuple] = []
+    for pname in sorted(must_del):
+        del_atoms.append(_ground_predicate(pname, pred_lookup, var_pool))
+
+    # ── 3. Collect variables that appear in the delta ──
+    delta_vars: Set[str] = set()
+    for atom in add_atoms + del_atoms:
+        delta_vars.update(atom[1:])  # skip predicate name
+
+    # ── 4. Minimal causal preconditions ──
+    # Ground every sink-true predicate, but keep only those sharing
+    # at least one variable with the delta effects.
+    precond_atoms: List[Tuple] = []
+    precond_preds: List[str] = []
+    for pname in sorted(candidate.sink_true_preds):
+        atom = _ground_predicate(pname, pred_lookup, var_pool)
+        atom_vars = set(atom[1:])
+        if atom_vars & delta_vars:
+            precond_atoms.append(atom)
+            precond_preds.append(pname)
+
+    # ── 5. Build typed parameter list from var_pool ──
+    parameters = [
+        TypedParam(name=vname, type=vtype)
+        for vname, vtype in var_pool.items()
+        # Only include vars that actually appear in precond + effects
+        if vname in delta_vars or any(
+            vname in atom[1:] for atom in precond_atoms
+        )
+    ]
+
+    name = f"recover_{candidate.sink_scc}_to_{candidate.source_scc}"
+    return SynthesizedOperator(
+        name=name,
+        parameters=parameters,
+        precondition_preds=precond_preds,
+        precondition_atoms=precond_atoms,
+        nominal_add=add_atoms,
+        nominal_del=del_atoms,
+        source_scc=candidate.source_scc,
+        sink_scc=candidate.sink_scc,
+        delta=candidate.delta,
+    )
 
 
-def _convert_to_action_schema(
-    op: SynthesizedOperator,
-    nominal_prob: float = 0.9,
-    failure_prob: float = 0.1,
-) -> ActionSchema:
-    """Convert a SynthesizedOperator into a pyPPDDL ActionSchema."""
-    # Build precondition S-expression
-    precond_atoms = []
-    for pred_name in op.precondition_preds:
-        # Use the first parameter as a generic variable
-        precond_atoms.append([pred_name] + [p.name for p in op.parameters[:1]])
+def _convert_to_action_schema(op: SynthesizedOperator) -> ActionSchema:
+    """Convert a SynthesizedOperator into a deterministic ActionSchema.
 
-    if len(precond_atoms) == 0:
+    Single effect at probability 1.0, no failure branch, no numeric
+    effects.  Step 1 (failure hallucination) and Step 6 (PPDDL
+    emission) will layer on probabilistic branches and rewards later.
+    """
+    # Build precondition S-expression from grounded atoms
+    if len(op.precondition_atoms) == 0:
         precondition = None
-    elif len(precond_atoms) == 1:
-        precondition = precond_atoms[0]
+    elif len(op.precondition_atoms) == 1:
+        precondition = list(op.precondition_atoms[0])
     else:
-        precondition = ["and"] + precond_atoms
+        precondition = ["and"] + [list(a) for a in op.precondition_atoms]
 
-    # Build effects
-    # Nominal effect
-    nominal_eff = Effect(prob=nominal_prob)
-    nominal_eff.add_predicates = list(op.nominal_add)
-    nominal_eff.del_predicates = list(op.nominal_del)
-    nominal_eff.numeric_effects = list(op.numeric_effects)
-
-    # Failure effect
-    failure_eff = Effect(prob=failure_prob)
-    failure_eff.add_predicates = list(op.failure_add)
-    failure_eff.del_predicates = list(op.failure_del)
+    # Single deterministic effect
+    eff = Effect(prob=1.0)
+    eff.add_predicates = list(op.nominal_add)
+    eff.del_predicates = list(op.nominal_del)
 
     action = ActionSchema(
         name=op.name,
         parameters=list(op.parameters),
         precondition=precondition,
-        effects=[nominal_eff, failure_eff],
+        effects=[eff],
     )
     op.action_schema = action
     return action
@@ -330,15 +391,17 @@ def delta_minimize(
     abstract_graph: nx.DiGraph,
     domain: Domain,
     *,
-    llm_fn: Optional[Callable[[str], str]] = None,
     config: Optional[ScoringConfig] = None,
-    nominal_prob: float = 0.9,
-    failure_prob: float = 0.1,
     mutex_groups: Optional[List[Any]] = None,
 ) -> DeltaMinimizationResult:
     """
-    Iteratively synthesize recovery operators to make the abstract
-    transition graph strongly connected (irreducible).
+    Iteratively synthesize deterministic recovery operators to make the
+    abstract transition graph strongly connected (irreducible).
+
+    Each recovery operator is computed purely from the predicate delta
+    between a sink and source SCC — no LLM call.  The resulting
+    ``ActionSchema`` has a single deterministic effect (prob 1.0) with
+    no failure branch and no numeric rewards.
 
     Parameters
     ----------
@@ -346,15 +409,8 @@ def delta_minimize(
         The abstract transition graph from Step 2.
     domain : Domain
         The pyPPDDL Domain (will be mutated with new actions).
-    llm_fn : callable, optional
-        Function(prompt: str) -> str.  If None, builds one from
-        ``llm.yaml`` / env-vars via :func:`llm_config.build_llm_fn`.
     config : ScoringConfig, optional
         Scoring parameters. Uses defaults if None.
-    nominal_prob : float
-        Probability for the nominal (success) effect of synthesized operators.
-    failure_prob : float
-        Probability for the failure effect of synthesized operators.
     mutex_groups : list[ExactlyOneGroup], optional
         If provided, uses :func:`mutex_aware_hamming_distance` instead
         of the naïve logical Hamming distance.
@@ -365,10 +421,6 @@ def delta_minimize(
     """
     if config is None:
         config = ScoringConfig()
-
-    if llm_fn is None:
-        from .llm_config import build_llm_fn
-        llm_fn = build_llm_fn()
 
     operators: List[SynthesizedOperator] = []
     stats = {"successful": 0, "failed": 0, "deltas": [], "iterations": 0}
@@ -465,52 +517,48 @@ def delta_minimize(
 
         candidates.sort(key=lambda c: c.weighted_score, reverse=True)
 
-        # ── Try top candidates ──
-        operator_added = False
-        for i, candidate in enumerate(candidates[: config.max_candidates_per_iter]):
+        # ── Pick the top candidate and synthesize deterministically ──
+        candidate = candidates[0]
+        logger.info(
+            f"  Bridging: SCC-{candidate.sink_scc} → "
+            f"SCC-{candidate.source_scc} (Δ={candidate.delta}, "
+            f"gain={candidate.topological_gain}, "
+            f"score={candidate.weighted_score:.3f})"
+        )
+
+        op = _synthesize_operator(candidate, domain)
+
+        # Convert to ActionSchema and add to domain
+        action_schema = _convert_to_action_schema(op)
+        domain.actions.append(action_schema)
+        operators.append(op)
+        stats["successful"] += 1
+        stats["deltas"].append(candidate.delta)
+
+        # Add edge to working graph (connect representative members)
+        sink_members = condensation.scc_state_map.get(candidate.sink_scc, [])
+        src_members = condensation.scc_state_map.get(candidate.source_scc, [])
+        if sink_members and src_members:
+            from_node = sink_members[0]
+            to_node = src_members[0]
+            working_graph.add_edge(
+                from_node,
+                to_node,
+                action=op.name,
+                prob=1.0,
+            )
+            op.sink_node = from_node
+            op.source_node = to_node
+
+        logger.info(f"    ✓ Synthesized: {op.name} ({op.sink_node} → {op.source_node})")
+
+        # Budget cap: stop after max_recovery_per_iter operators
+        if (config.max_recovery_per_iter is not None
+                and len(operators) >= config.max_recovery_per_iter):
             logger.info(
-                f"  Trying #{i + 1}: SCC-{candidate.sink_scc} → "
-                f"SCC-{candidate.source_scc} (Δ={candidate.delta}, "
-                f"gain={candidate.topological_gain}, "
-                f"score={candidate.weighted_score:.3f})"
+                f"  Budget cap reached ({config.max_recovery_per_iter} "
+                f"operators this iteration)"
             )
-
-            op = _synthesize_operator(candidate, llm_fn)
-            if op is None:
-                stats["failed"] += 1
-                continue
-
-            # Convert to ActionSchema and add to domain
-            action_schema = _convert_to_action_schema(
-                op, nominal_prob=nominal_prob, failure_prob=failure_prob
-            )
-            domain.actions.append(action_schema)
-            operators.append(op)
-            stats["successful"] += 1
-            stats["deltas"].append(candidate.delta)
-
-            # Add edge to working graph (connect representative members)
-            sink_members = condensation.scc_state_map.get(candidate.sink_scc, [])
-            src_members = condensation.scc_state_map.get(candidate.source_scc, [])
-            if sink_members and src_members:
-                from_node = sink_members[0]
-                to_node = src_members[0]
-                working_graph.add_edge(
-                    from_node,
-                    to_node,
-                    action=op.name,
-                    prob=nominal_prob,
-                )
-                # Store original node IDs for correct replay/visualization
-                op.sink_node = from_node
-                op.source_node = to_node
-
-            operator_added = True
-            logger.info(f"    ✓ Synthesized: {op.name} ({op.sink_node} → {op.source_node})")
-            break
-
-        if not operator_added:
-            logger.warning("LLM failed on all candidates this iteration. Stopping.")
             break
 
     # Final check
@@ -520,15 +568,10 @@ def delta_minimize(
     avg_delta = (
         sum(stats["deltas"]) / len(stats["deltas"]) if stats["deltas"] else 0
     )
-    success_rate = (
-        stats["successful"] / (stats["successful"] + stats["failed"])
-        if (stats["successful"] + stats["failed"]) > 0
-        else 0
-    )
 
     logger.info(
         f"Delta minimization complete: {len(operators)} operators synthesized, "
-        f"avg delta={avg_delta:.1f}, success rate={success_rate:.1%}"
+        f"avg delta={avg_delta:.1f}"
     )
 
     return DeltaMinimizationResult(

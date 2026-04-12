@@ -85,3 +85,6 @@ venv/
 # Output
 outputs/
 *.html
+experiments/
+figures/
+docs/

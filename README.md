@@ -6,7 +6,7 @@ On top of the FODD core, pyrmdp ships a **synthesis pipeline** that:
 
 1. Generates a PDDL domain from a single RGB image + natural-language task description,
 2. Hallucinates failure modes, extracts an abstract Markov chain via lifted FODDs,
-3. Iteratively synthesizes recovery operators until the chain is strongly connected,
+3. Deterministically synthesizes recovery operators (via variable unification) until the chain is strongly connected,
 4. Emits a multi-policy PPDDL with reward-annotated human/robot branches.
 
 **TL;DR** — Given an image + task → output a complete PPDDL domain.
@@ -26,7 +26,7 @@ On top of the FODD core, pyrmdp ships a **synthesis pipeline** that:
   - [2.5 R5 — LLM-Based Mutex Pruning (Optional)](#25-r5--llm-based-mutex-pruning-optional)
   - [2.6 Step 3 — SCC Condensation](#26-step-3--scc-condensation)
   - [2.7 Step 4 — MSCA Bound Computation](#27-step-4--msca-bound-computation)
-  - [2.8 Step 5 — Delta Minimization & Recovery Synthesis](#28-step-5--delta-minimization--recovery-synthesis)
+  - [2.8 Step 5 — Delta Minimization & Deterministic Recovery Synthesis](#28-step-5--delta-minimization--deterministic-recovery-synthesis)
   - [2.9 Spectral Convergence Loop (Steps 1–5)](#29-spectral-convergence-loop-steps-15)
   - [2.10 Step 6 — Multi-Policy PPDDL Emission](#210-step-6--multi-policy-ppddl-emission)
 - [3. Architecture](#3-architecture)
@@ -86,15 +86,19 @@ RGB + Task NL ──► Step 0 ──►  ┌─ Step 1 ──► Step 2 ──�
                                      Multi-Policy Emission
 ```
 
-The pipeline has **5 LLM-based tasks**, each with an independent prompt file:
+The pipeline has **4 LLM-based tasks**, each with an independent prompt file.
+Step 5 (recovery synthesis) is **fully deterministic** — no LLM call required.
 
 | LLM Task | Prompt File | Step |
 |----------|-------------|------|
 | Scene → Types + Predicates (VLM) | `prompts/vlm_domain_prompt.py` | 0a |
 | Task NL → Operators (LLM) | `prompts/llm_operator_prompt.py` | 0b |
 | Action → Failure Mode (LLM) | `prompts/llm_failure_prompt.py` | 1 |
-| Sink→Source Recovery Operator (LLM) | `prompts/llm_recovery_prompt.py` | 5 |
 | Predicates → Mutex Constraints (LLM) | `prompts/llm_mutex_prompt.py` | R5 |
+
+> **Note:** Step 5 previously used `prompts/llm_recovery_prompt.py` to query the
+> LLM for recovery operators. This was replaced with deterministic synthesis
+> (variable unification + minimal causal preconditions) — see §2.8.
 
 ---
 
@@ -252,17 +256,16 @@ Identify structural deficiencies in the condensation DAG.
 
 ---
 
-### 2.8 Step 5 — Delta Minimization & Recovery Synthesis
+### 2.8 Step 5 — Delta Minimization & Deterministic Recovery Synthesis
 
 **Module:** `synthesis/delta_minimizer.py`
 
-Iteratively synthesize recovery operators to bridge sink → source SCC pairs, making the graph strongly connected.
+Iteratively synthesize recovery operators to bridge sink → source SCC pairs, making the graph strongly connected. Recovery operators are computed **deterministically** from the predicate delta — no LLM call required.
 
 | | |
 |---|---|
-| **Input** | Abstract graph, Domain, condensation DAG |
-| **LLM Task** | Per-pair recovery operator synthesis |
-| **Prompt** | `prompts/llm_recovery_prompt.py` |
+| **Input** | Abstract graph, `Domain`, condensation DAG |
+| **LLM Task** | *None* — fully deterministic |
 | **Output** | `DeltaMinimizationResult` — synthesized operators + updated graph |
 
 **Algorithm:**
@@ -270,9 +273,12 @@ Iteratively synthesize recovery operators to bridge sink → source SCC pairs, m
 2. **Scoring:** Rank candidates by α·(1 − norm_delta) + β·(norm_gain), default α=0.7, β=0.3
 3. **Synthesis loop** (up to `max_delta_iterations`):
    - Pick the top-scored candidate
-   - Query the LLM to synthesize a PPDDL operator (precondition in sink, effect toward source) + failure mode
-   - Convert to `ActionSchema` with nominal + failure branches
-   - Add the new action to the domain and edge to the graph
+   - **Deterministically compute** a recovery operator:
+     - **Effects** — `must_add = source_true − sink_true`, `must_del = sink_true − source_true` (the predicate delta)
+     - **Variable Unification** — each bare predicate name is looked up in the domain's `:predicates` and grounded using the domain's canonical variable names (e.g. `holding` → `(holding ?r - robot ?x - movable)`). Predicates sharing a variable name (like `?r`) are automatically unified.
+     - **Minimal Causal Preconditions** — only sink-state predicates that share ≥1 unified variable with the delta effects are included in the precondition. Unrelated predicates (e.g. `stove-on` when the delta is about `holding`) are discarded.
+     - **Single deterministic effect** — probability 1.0, no failure branch, no numeric rewards. Failure branches are injected by Step 1 (hallucination) in the next iteration; rewards are injected by Step 6 (PPDDL emission).
+   - Convert to `ActionSchema` and add to the domain + graph
    - Re-condense and re-evaluate
    - Stop when the DAG collapses to a single SCC (irreducible)
 
@@ -280,6 +286,8 @@ Iteratively synthesize recovery operators to bridge sink → source SCC pairs, m
 ```
 Δ(U, V) = |T_U ∩ F_V| + |F_U ∩ T_V| + |T_V \ (T_U ∪ F_U)| + |F_V \ (T_U ∪ F_U)|
 ```
+
+**Why deterministic?** The precondition and effect are fully determined by the abstract state pair — there is nothing for the LLM to invent. Step 5 now runs **instantly** (no HTTP requests), making the overall pipeline significantly faster.
 
 ---
 
@@ -297,10 +305,41 @@ Wraps Steps 1–5 in a convergence-controlled while-loop.
 **Algorithm:**
 1. Run Steps 1–5 (hallucinate failures → build graph → condense → augment)
 2. Extract the transition matrix M_abs from the abstract graph
-3. Compute sorted eigenvalue arrays Λ_curr and Λ_prev
-4. Measure **spectral distance**: Δ = ‖Λ_curr − Λ_prev‖₂ (zero-padded to equal length)
-5. If Δ < ε → converged; else loop back to Step 1 with the updated domain
+3. Compute sorted eigenvalue magnitude arrays Λ_curr and Λ_prev
+4. Measure **spectral distance** via three metrics (see below)
+5. If Δ_Wasserstein < ε → converged; else loop back to Step 1 with the updated domain
 6. On convergence → proceed to Step 6
+
+**Spectral Distance Metrics:**
+
+Three metrics are computed each iteration for convergence checking and ablation analysis:
+
+| Metric | Formula | Range | Dimension-invariant? | Role |
+|--------|---------|-------|---------------------|------|
+| **Wasserstein distance** (primary) | W₁(Λ_curr, Λ_prev) | [0, ∞) | ✅ (no padding needed) | **Convergence criterion** (Δ < ε) |
+| **Cosine distance** (secondary) | 1 − cos(Λ_curr, Λ_prev) | [0, 2] | ✅ (zero-padded) | Ablation / diagnostics |
+| **L2 norm** (secondary) | ‖Λ_curr − Λ_prev‖₂ | [0, ∞) | ❌ (grows with √n) | Baseline / ablation |
+
+**Why Wasserstein (primary)?** `scipy.stats.wasserstein_distance` treats the sorted eigenvalue magnitudes
+as empirical distributions and computes the optimal transport cost. It is naturally
+dimension-invariant (no zero-padding needed) and provides the tightest convergence signal —
+typically 1–2 orders of magnitude smaller than cosine distance. Default ε = 0.1.
+
+**Why cosine (secondary)?** As the graph grows via recovery operators, new absorbing sinks add eigenvalue 1.
+Raw L2 measures √(new_states) ≈ 2–3 per iteration regardless of structural convergence.
+Cosine normalises by vector magnitude, making it insensitive to proportional growth.
+Retained as a diagnostic metric alongside L2.
+
+**Budget cap:** `max_recovery_per_iter` limits the number of recovery operators
+synthesised per iteration (Step 5). With budget=1, each iteration adds at most
+one operator, creating a longer convergence trajectory ideal for studying spectral
+behaviour. The default is unlimited (all necessary operators per iteration).
+
+**Convergence diagnostics** recorded in `pipeline_summary.json`:
+- `spectral_distances_wasserstein` — Wasserstein EMD per iteration (primary)
+- `spectral_distances` — cosine distance per iteration
+- `spectral_distances_l2` — L2 norm per iteration
+- `per_iteration[i].eigenvalues` — full eigenvalue magnitude array
 
 ---
 
@@ -364,19 +403,23 @@ pyrmdp/
 │   │   │   ├── vlm_domain_prompt.py     # Step 0a — RGB → types + predicates
 │   │   │   ├── llm_operator_prompt.py   # Step 0b — task NL → operators
 │   │   │   ├── llm_failure_prompt.py    # Step 1  — failure hallucination
-│   │   │   ├── llm_recovery_prompt.py   # Step 5  — recovery operator synthesis
+│   │   │   ├── llm_recovery_prompt.py   # (legacy — Step 5 is now deterministic)
 │   │   │   └── llm_mutex_prompt.py      # R5      — mutex constraint generation
 │   │   ├── domain_genesis.py            # Step 0 — orchestrates 0a + 0b → PDDL domain
 │   │   ├── llm_failure.py               # Step 1 — LLM failure hallucination logic
 │   │   ├── fodd_builder.py              # Step 2 — lifted FODD construction + abstract states
 │   │   ├── graph_analysis.py            # Steps 3 & 4 — SCC condensation + MSCA bound
-│   │   ├── delta_minimizer.py           # Step 5 — iterative delta minimization logic
+│   │   ├── delta_minimizer.py           # Step 5 — deterministic recovery synthesis (no LLM)
 │   │   ├── iterative_synthesizer.py     # Iterative loop (Steps 1–5) w/ spectral convergence
 │   │   └── ppddl_emitter.py            # Step 6 — multi-policy PPDDL emission
 │   └── vis/
 │       └── visualization.py             # pyvis interactive FODD/graph plotting
 ├── scripts/
 │   ├── run_pipeline.py                  # End-to-end pipeline (Steps 0–6) CLI
+│   ├── run_all_testdata.py              # Batch runner — all test cases in parallel
+│   ├── run_experiment1_convergence.py   # Experiment 1 — spectral convergence budget sweep
+│   ├── plot_convergence.py              # Publication-quality convergence plots
+│   ├── plot_metrics_comparison.py       # 3-metric (cosine/L2/Wasserstein) comparison plot
 │   ├── generate_add.py                  # Build & visualize an FODD from PPDDL
 │   └── generate_markov.py              # Build & visualize abstract Markov chain
 ├── llm.yaml                             # LLM connection config (API key, model, etc.)
@@ -402,6 +445,10 @@ All prompt files share `response_parser.py` for JSON extraction (strip markdown 
 **Separation of concerns:**
 - **Prompt files** (`prompts/*.py`) — prompt templates + response parsing (pure text → data)
 - **Logic files** (`llm_failure.py`, `delta_minimizer.py`, etc.) — domain objects, algorithm logic, LLM call orchestration
+
+> **Note:** `delta_minimizer.py` no longer calls the LLM. Recovery operators
+> are computed deterministically (see §2.8). The legacy prompt file
+> `prompts/llm_recovery_prompt.py` is retained but unused.
 
 ### 3.3 Configuration System
 
@@ -525,8 +572,9 @@ python scripts/run_pipeline.py \
 # pyrmdp pipeline configuration
 
 # ── Iterative convergence loop
-epsilon: 0.05               # Δ_spectral < ε → stop
+epsilon: 0.02               # Δ_cosine < ε → stop
 max_loop_iterations: 10     # hard cap on outer loop
+max_recovery_per_iter: null # budget cap per iteration (null = unlimited)
 
 # ── Step 1: Failure Hallucination
 failure_prob: 0.1           # P(failure branch) per action
@@ -534,12 +582,11 @@ failure_prob: 0.1           # P(failure branch) per action
 # ── Step 2: Abstract State Pruning
 enable_mutex_pruning: false  # enable R5 LLM mutex pruning
 
-# ── Step 5: Delta Minimization
+# ── Step 5: Delta Minimization (deterministic — no LLM)
 scoring_alpha: 0.7          # weight for delta similarity
 scoring_beta: 0.3           # weight for topological gain
 max_delta_iterations: 50    # max synthesis iterations per loop pass
 max_candidates_per_iter: 10
-delta_threshold: 15         # max predicate delta for LLM prompt
 
 # ── Step 6: Multi-Policy Emission
 num_robot_policies: 3
@@ -580,11 +627,12 @@ max_retries: 2
 | `--enable-mutex-pruning` | off | Enable R5 LLM-based mutex pruning (Step 2) |
 | `--save-intermediates` | off | Save per-step JSON/GraphML files |
 | `--failure-prob` | `0.1` | Failure branch probability (Step 1) |
-| `--max-delta-iterations` | `50` | Max synthesis iterations (Step 5) |
+| `--max-delta-iterations` | `50` | Max synthesis iterations — Step 5 (deterministic) |
 | `--scoring-alpha` | `0.7` | Delta similarity weight (Step 5) |
 | `--scoring-beta` | `0.3` | Topological gain weight (Step 5) |
-| `--epsilon` | `0.05` | Spectral-distance convergence threshold |
+| `--epsilon` | `0.02` | Spectral-distance (cosine) convergence threshold |
 | `--max-loop-iterations` | `10` | Maximum iterations for Steps 1–5 loop |
+| `--max-recovery-per-iter` | unlimited | Budget cap: max recovery operators per iteration |
 | `--success-reward` | `10.0` | Reward for success branch (Step 6) |
 | `--unchanged-reward` | `-1.0` | Reward for unchanged branch (Step 6) |
 | `--failure-reward` | `-10.0` | Reward for failure branch (Step 6) |

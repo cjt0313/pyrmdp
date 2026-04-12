@@ -40,8 +40,9 @@ class PipelineConfig:
     """
 
     # ── Iterative convergence loop ───────────────────────────────
-    epsilon: float = 0.05
-    """Spectral-distance threshold Δ < ε to declare convergence."""
+    epsilon: float = 0.1
+    """Wasserstein spectral-distance threshold Δ_W < ε to declare convergence.
+    Wasserstein distance is dimension-invariant and provides the tightest signal."""
 
     max_loop_iterations: int = 10
     """Hard cap on outer loop iterations (Steps 1→5)."""
@@ -63,6 +64,9 @@ class PipelineConfig:
 
     max_delta_iterations: int = 50
     """Max iterations inside the delta-minimizer per loop pass."""
+
+    max_recovery_per_iter: Optional[int] = None
+    """Budget cap on recovery operators per outer-loop iteration (None = unlimited)."""
 
     max_candidates_per_iter: int = 10
     """Candidates to try per delta-minimization iteration."""
@@ -119,6 +123,7 @@ class PipelineConfig:
             max_iterations=self.max_delta_iterations,
             max_candidates_per_iter=self.max_candidates_per_iter,
             delta_threshold=self.delta_threshold,
+            max_recovery_per_iter=self.max_recovery_per_iter,
         )
 
     def emission_config(self):
@@ -173,7 +178,8 @@ class PipelineConfig:
             ],
             "# ── Step 5: Delta Minimization": [
                 "scoring_alpha", "scoring_beta", "max_delta_iterations",
-                "max_candidates_per_iter", "delta_threshold",
+                "max_recovery_per_iter", "max_candidates_per_iter",
+                "delta_threshold",
             ],
             "# ── Step 6: Multi-Policy Emission": [
                 "num_robot_policies",

@@ -165,6 +165,7 @@ def hallucinate_failures(
     *,
     llm_fn: Optional[Any] = None,
     failure_prob: float = 0.1,
+    action_names: Optional[set] = None,
 ) -> Tuple[Domain, List[FailureHallucinationResult]]:
     """
     For each action in *domain*, hallucinate a failure mode via LLM.
@@ -183,6 +184,10 @@ def hallucinate_failures(
     failure_prob : float
         Probability assigned to the failure branch (default 0.1).
         Existing effect probabilities are rescaled to (1 - failure_prob).
+    action_names : set, optional
+        If provided, only hallucinate failures for actions whose names
+        are in this set.  Other actions are left unchanged.  If *None*
+        (the default), all actions are processed.
     
     Returns
     -------
@@ -193,6 +198,9 @@ def hallucinate_failures(
     results: List[FailureHallucinationResult] = []
     
     for action in augmented.actions:
+        # Skip actions not in the requested set
+        if action_names is not None and action.name not in action_names:
+            continue
         logger.info(f"Hallucinating failure for action: {action.name}")
         
         action_desc = _format_action_for_prompt(action, augmented)

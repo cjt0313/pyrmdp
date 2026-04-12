@@ -3,13 +3,17 @@ Step 6: Multi-Policy Operator Expansion → PPDDL Output
 
 Transforms the final domain (base operators + synthesized recovery operators)
 into a well-formed PPDDL file. For every operator, expands into K+1 versions:
-  - K Robot Policies: probabilistic actions with 3 branches (success/unchanged/worse)
+  - K Robot Policies: probabilistic actions with reward annotations
   - 1 Human Policy: deterministic, 100% success, reward 0
 
-Each robot policy branch has reward annotations:
+Actions that went through Step 1 failure hallucination get 3 branches:
   - Success (nominal effect): reward +10
   - Unchanged (no effect):    reward -1
   - Worse (failure effect):   reward -10
+
+Deterministic recovery operators (from Step 5, no failure branch) get 2 branches:
+  - Success (nominal effect): reward +10
+  - Unchanged (no effect):    reward -1
 """
 
 from __future__ import annotations
@@ -47,10 +51,13 @@ class PolicyExpansionConfig:
     unchanged_reward: float = -1.0
     failure_reward: float = -10.0
     human_reward: float = 0.0
-    # Initial uniform prior for robot policies
+    # Priors for actions WITH a failure branch (3-branch: success/unchanged/worse)
     initial_success_prob: float = 1 / 3
     initial_unchanged_prob: float = 1 / 3
     initial_failure_prob: float = 1 / 3
+    # Priors for actions WITHOUT a failure branch (2-branch: success/unchanged)
+    deterministic_success_prob: float = 0.5
+    deterministic_unchanged_prob: float = 0.5
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -148,14 +155,26 @@ def _expand_action_robot_policy(
     config: PolicyExpansionConfig,
 ) -> ActionSchema:
     """
-    Expand an action into a single robot-policy variant with 3 probabilistic
-    branches: success, unchanged, worse.
+    Expand an action into a single robot-policy variant.
+
+    Actions **with** a failure branch (from Step 1 hallucination) get
+    3 probabilistic branches: success / unchanged / worse.
+
+    Actions **without** a failure branch (deterministic recovery
+    operators from Step 5) get 2 branches: success / unchanged.
+    No dummy "worse" branch is emitted — the failure mode does not
+    exist yet.
     """
     nominal = _get_nominal_effect(action)
     failure = _get_failure_effect(action)
 
     # Success branch: nominal effect + success reward
-    success_eff = Effect(prob=config.initial_success_prob)
+    if failure is not None:
+        success_prob = config.initial_success_prob
+    else:
+        success_prob = config.deterministic_success_prob
+
+    success_eff = Effect(prob=success_prob)
     success_eff.add_predicates = list(nominal.add_predicates)
     success_eff.del_predicates = list(nominal.del_predicates)
     success_eff.numeric_effects = list(nominal.numeric_effects) + [
@@ -163,29 +182,33 @@ def _expand_action_robot_policy(
     ]
 
     # Unchanged branch: no predicate changes, penalty reward
-    unchanged_eff = Effect(prob=config.initial_unchanged_prob)
+    if failure is not None:
+        unchanged_prob = config.initial_unchanged_prob
+    else:
+        unchanged_prob = config.deterministic_unchanged_prob
+
+    unchanged_eff = Effect(prob=unchanged_prob)
     unchanged_eff.numeric_effects = [
         ("increase", "reward", config.unchanged_reward)
     ]
 
-    # Worse branch: failure effect (or no-op with penalty if no failure)
-    worse_eff = Effect(prob=config.initial_failure_prob)
+    effects = [success_eff, unchanged_eff]
+
+    # Worse branch: only if a failure effect exists
     if failure is not None:
+        worse_eff = Effect(prob=config.initial_failure_prob)
         worse_eff.add_predicates = list(failure.add_predicates)
         worse_eff.del_predicates = list(failure.del_predicates)
         worse_eff.numeric_effects = list(failure.numeric_effects) + [
             ("increase", "reward", config.failure_reward)
         ]
-    else:
-        worse_eff.numeric_effects = [
-            ("increase", "reward", config.failure_reward)
-        ]
+        effects.append(worse_eff)
 
     return ActionSchema(
         name=f"{action.name}_robot{policy_idx}",
         parameters=list(action.parameters),
         precondition=action.precondition,
-        effects=[success_eff, unchanged_eff, worse_eff],
+        effects=effects,
     )
 
 
