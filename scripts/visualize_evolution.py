@@ -27,42 +27,71 @@ import networkx as nx
 
 def load_pipeline_data(output_dir: Path) -> dict:
     """Load all relevant pipeline output files."""
+    import re as _re
     data = {}
 
-    # Abstract graph
-    ag_path = output_dir / "iter1_step2_abstract_graph.graphml"
-    if ag_path.exists():
-        data["graph"] = nx.read_graphml(ag_path)
+    # ── Discover iterations ──
+    iter_graph_files = sorted(output_dir.glob("iter*_step2_abstract_graph.graphml"))
+    iter_nums = []
+    for p in iter_graph_files:
+        m = _re.search(r"iter(\d+)_", p.name)
+        if m:
+            iter_nums.append(int(m.group(1)))
 
-    # Abstract states (for labels)
-    states_path = output_dir / "iter1_step2_abstract_states.json"
-    if states_path.exists():
-        with open(states_path) as f:
-            data["states"] = json.load(f)
+    if not iter_nums:
+        return data
 
-    # Condensation
-    cond_path = output_dir / "iter1_step3_condensation.json"
-    if cond_path.exists():
-        with open(cond_path) as f:
-            data["condensation"] = json.load(f)
+    # ── Per-iteration data ──
+    iterations_data: list[dict] = []
+    for it in iter_nums:
+        it_data: dict = {"iteration": it}
 
-    # Step 5 operators
-    ops_path = output_dir / "iter1_step5_synthesized_operators.json"
-    if ops_path.exists():
-        with open(ops_path) as f:
-            data["operators"] = json.load(f)
+        ag_path = output_dir / f"iter{it}_step2_abstract_graph.graphml"
+        if ag_path.exists():
+            it_data["graph"] = nx.read_graphml(ag_path)
 
-    # Step 1 failures
+        states_path = output_dir / f"iter{it}_step2_abstract_states.json"
+        if states_path.exists():
+            with open(states_path) as f:
+                it_data["states"] = json.load(f)
+
+        cond_path = output_dir / f"iter{it}_step3_condensation.json"
+        if cond_path.exists():
+            with open(cond_path) as f:
+                it_data["condensation"] = json.load(f)
+
+        ops_path = output_dir / f"iter{it}_step5_synthesized_operators.json"
+        if ops_path.exists():
+            with open(ops_path) as f:
+                it_data["operators"] = json.load(f)
+
+        aug_path = output_dir / f"iter{it}_step4_augmentation_bound.json"
+        if aug_path.exists():
+            with open(aug_path) as f:
+                it_data["augmentation"] = json.load(f)
+
+        stats_path = output_dir / f"iter{it}_step5_stats.json"
+        if stats_path.exists():
+            with open(stats_path) as f:
+                it_data["step5_stats"] = json.load(f)
+
+        iterations_data.append(it_data)
+
+    data["iterations_data"] = iterations_data
+
+    # Keep first iteration's data as legacy top-level keys for backward compat
+    first = iterations_data[0]
+    data["graph"] = first.get("graph", nx.DiGraph())
+    data["states"] = first.get("states", [])
+    data["condensation"] = first.get("condensation", {})
+    data["operators"] = first.get("operators", [])
+    data["augmentation"] = first.get("augmentation", {})
+
+    # Step 1 failures (iter1 only for the failure_map)
     fail_path = output_dir / "iter1_step1_failures.json"
     if fail_path.exists():
         with open(fail_path) as f:
             data["failures"] = json.load(f)
-
-    # Augmentation bound
-    aug_path = output_dir / "iter1_step4_augmentation_bound.json"
-    if aug_path.exists():
-        with open(aug_path) as f:
-            data["augmentation"] = json.load(f)
 
     # Pipeline summary
     summary_path = output_dir / "pipeline_summary.json"
@@ -126,11 +155,14 @@ def build_state_label_map(states: list) -> dict:
     for s in states:
         sid = s["id"]
         true_preds = s.get("true", [])
-        # Compact: first 3 predicates
-        short = ", ".join(true_preds[:3])
+        false_preds = s.get("false", [])
+        parts = list(true_preds[:3])
         if len(true_preds) > 3:
-            short += f" +{len(true_preds)-3}"
-        label_map[sid] = short
+            parts.append(f"+{len(true_preds)-3}")
+        parts.extend(f"¬{p}" for p in false_preds[:2])
+        if len(false_preds) > 2:
+            parts.append(f"+{len(false_preds)-2}")
+        label_map[sid] = ", ".join(parts)
     return label_map
 
 
@@ -545,6 +577,8 @@ def parse_ppddl_domain_info(ppddl_text: str) -> dict:
 
 def generate_html(data: dict) -> str:
     """Generate the full evolution HTML page."""
+    import re as _re
+
     graph = data.get("graph", nx.DiGraph())
     states = data.get("states", [])
     condensation = data.get("condensation", {})
@@ -554,6 +588,8 @@ def generate_html(data: dict) -> str:
     origins = data.get("origins", {"types": {}, "predicates": {}})
     summary = data.get("summary", {})
     hallucination_audit = data.get("hallucination_audit", [])
+    iterations_data = data.get("iterations_data", [])
+
     label_map = build_state_label_map(states)
     scc_map = build_scc_map(condensation)
 
@@ -580,113 +616,294 @@ def generate_html(data: dict) -> str:
         except Exception:
             failure_map[act] = ""
 
-    label_map = build_state_label_map(states)
-    scc_map = build_scc_map(condensation)
+    # ── Build multi-iteration phases ──
+    # Each phase: { iteration, nodes (new), originalEdges (new), recoveryEdges }
+    # Nodes/edges from later iterations that don't exist in earlier ones are "new".
 
-    # ── Build nodes JSON ──
-    nodes_js = []
-    for node_id in graph.nodes():
-        scc_id = scc_map.get(node_id, 0)
-        label = label_map.get(node_id, node_id[:8])
-        # Full state info for tooltip
-        state_info = next((s for s in states if s["id"] == node_id), {})
+    # Helper functions (moved out of loop)
+    def _fmt_atoms(atoms):
+        parts = []
+        for a in atoms:
+            if isinstance(a, (list, tuple)) and len(a) > 1:
+                parts.append(f"{a[0]}({', '.join(a[1:])})")
+            elif isinstance(a, (list, tuple)):
+                parts.append(a[0] if a else "?")
+            else:
+                parts.append(str(a))
+        return parts
+
+    def _fmt_params(params):
+        parts = []
+        for p in params:
+            if isinstance(p, dict):
+                parts.append(f"{p.get('name','?')} - {p.get('type','?')}")
+            else:
+                parts.append(str(p))
+        return ", ".join(parts)
+
+    def _build_node(node_id, it_states, it_scc_map, iteration):
+        """Build a vis.js node dict for one abstract state."""
+        scc_id = it_scc_map.get(node_id, 0)
+        state_info = next((s for s in it_states if s["id"] == node_id), {})
         true_preds = state_info.get("true", [])
         false_preds = state_info.get("false", [])
-
+        parts = list(true_preds[:3])
+        if len(true_preds) > 3:
+            parts.append(f"+{len(true_preds)-3}")
+        parts.extend(f"¬{p}" for p in false_preds[:2])
+        if len(false_preds) > 2:
+            parts.append(f"+{len(false_preds)-2}")
+        short = ", ".join(parts)
         tooltip_lines = [
             f"<b>{node_id}</b>",
-            f"SCC: {scc_id}",
+            f"SCC: {scc_id}  (iter {iteration})",
             f"<br><b>True:</b> {', '.join(true_preds)}",
         ]
         if false_preds:
             tooltip_lines.append(f"<b>False:</b> {', '.join(false_preds)}")
-
-        nodes_js.append({
+        return {
             "id": node_id,
-            "label": label,
+            "label": short or node_id[:8],
             "title": "<br>".join(tooltip_lines),
             "group": scc_id,
             "scc": scc_id,
+            "iteration": iteration,
+        }
+
+    all_phases = []
+    seen_node_ids: set = set()
+    seen_edge_keys: set = set()     # (from, to, action) tuples
+
+    for it_data in iterations_data:
+        it = it_data["iteration"]
+        it_graph = it_data.get("graph", nx.DiGraph())
+        it_states = it_data.get("states", [])
+        it_cond = it_data.get("condensation", {})
+        it_ops = it_data.get("operators", [])
+        it_aug = it_data.get("augmentation", {})
+        it_scc_map = build_scc_map(it_cond)
+
+        # New nodes
+        new_nodes = []
+        for node_id in it_graph.nodes():
+            if node_id not in seen_node_ids:
+                new_nodes.append(_build_node(node_id, it_states, it_scc_map, it))
+                seen_node_ids.add(node_id)
+
+        # New original edges
+        new_orig_edges = []
+        for u, v, d in it_graph.edges(data=True):
+            action = d.get("action", "?")
+            ekey = (u, v, action)
+            if ekey not in seen_edge_keys:
+                new_orig_edges.append({
+                    "from": u, "to": v,
+                    "label": action,
+                    "title": f"Action: {action}",
+                    "action": action,
+                })
+                seen_edge_keys.add(ekey)
+
+        # Recovery edges for this iteration
+        # Determine Phase 1 vs Phase 2 split from step5 stats
+        it_step5_stats = it_data.get("step5_stats", {})
+        phase1_count = it_step5_stats.get("phase1_ops", 0)
+        num_wccs = it_step5_stats.get("num_wccs", 1)
+
+        it_recovery = []
+        for i, op in enumerate(it_ops):
+            from_node = op.get("sink_node", "")
+            to_node = op.get("source_node", "")
+            if not from_node or not to_node:
+                sink_scc = str(op["sink_scc"])
+                source_scc = str(op["source_scc"])
+                sink_members = it_cond.get("sccs", {}).get(sink_scc, [])
+                source_members = it_cond.get("sccs", {}).get(source_scc, [])
+                from_node = sink_members[0] if sink_members else f"SCC-{sink_scc}"
+                to_node = source_members[0] if source_members else f"SCC-{source_scc}"
+
+            adds = _fmt_atoms(op.get('nominal_add', []))
+            dels = _fmt_atoms(op.get('nominal_del', []))
+            preconds = _fmt_atoms(op.get('precondition_atoms', []))
+            params = _fmt_params(op.get('parameters', []))
+
+            edge_phase = 1 if i < phase1_count else 2
+            phase_label = "MWCC" if edge_phase == 1 else "Reachability"
+            it_recovery.append({
+                "from": from_node, "to": to_node,
+                "label": op["name"],
+                "title": (
+                    f"<b>Recovery (iter {it}, Phase {edge_phase} — {phase_label}):</b> {op['name']}<br>"
+                    f"Δ={op['delta']} | {from_node} → {to_node}<br>"
+                    f"Params: ({params})<br>"
+                    f"Pre: {', '.join(preconds) if preconds else '(none)'}<br>"
+                    f"Add: {', '.join(adds) if adds else '(none)'}<br>"
+                    f"Del: {', '.join(dels) if dels else '(none)'}"
+                ),
+                "delta": op["delta"],
+                "phase": edge_phase,
+                "iteration": it,
+                "sink_scc": op.get("sink_scc", -1),
+                "source_scc": op.get("source_scc", -1),
+            })
+
+        all_phases.append({
+            "iteration": it,
+            "newNodes": new_nodes,
+            "newOriginalEdges": new_orig_edges,
+            "recoveryEdges": it_recovery,
+            "provenanceEdges": [],          # filled in post-processing below
+            "numStates": len(it_graph.nodes()),
+            "numEdges": len(it_graph.edges()),
+            "sources": it_aug.get("sources", []),
+            "sinks": it_aug.get("sinks", []),
+            "numWCCs": num_wccs,
+            "phase1Count": phase1_count,
         })
 
-    # ── Build original edges (Step 2) ──
-    original_edges_js = []
-    for u, v, d in graph.edges(data=True):
-        action = d.get("action", "?")
-        original_edges_js.append({
-            "from": u,
-            "to": v,
-            "label": action,
-            "title": f"Action: {action}",
-            "action": action,
-        })
+    # ── Post-process: add provenance edges for orphan nodes ──
+    # When a later iteration has new nodes that are disconnected from
+    # the old graph (e.g. precondition-states of recovery operators
+    # explored in the hallucination step), add lightweight "provenance"
+    # edges linking each orphan cluster back to the iter-(k-1) node
+    # from which the recovery operator originated.
+    for pi in range(1, len(all_phases)):
+        phase = all_phases[pi]
+        new_node_ids = {n["id"] for n in phase["newNodes"]}
+        if not new_node_ids:
+            continue
 
-    # ── Build recovery edges (Step 5), ordered by iteration ──
-    recovery_edges_js = []
-    for i, op in enumerate(operators):
-        # Prefer stored original node IDs (correct across re-condensations).
-        # Fall back to SCC mapping for legacy data.
-        from_node = op.get("sink_node", "")
-        to_node = op.get("source_node", "")
-        if not from_node or not to_node:
-            # Legacy: map SCC IDs via initial condensation (may be wrong)
-            sink_scc = str(op["sink_scc"])
-            source_scc = str(op["source_scc"])
-            sink_members = condensation.get("sccs", {}).get(sink_scc, [])
-            source_members = condensation.get("sccs", {}).get(source_scc, [])
-            from_node = sink_members[0] if sink_members else f"SCC-{sink_scc}"
-            to_node = source_members[0] if source_members else f"SCC-{source_scc}"
+        # Collect all previously-seen node IDs (old nodes)
+        old_node_ids: set = set()
+        for prev_phase in all_phases[:pi]:
+            for n in prev_phase["newNodes"]:
+                old_node_ids.add(n["id"])
 
-        # Format atoms as readable strings: ["holding", "?r", "?x"] -> "holding(?r, ?x)"
-        def fmt_atoms(atoms):
-            parts = []
-            for a in atoms:
-                if isinstance(a, (list, tuple)) and len(a) > 1:
-                    parts.append(f"{a[0]}({', '.join(a[1:])})")
-                elif isinstance(a, (list, tuple)):
-                    parts.append(a[0] if a else "?")
-                else:
-                    parts.append(str(a))
-            return parts
+        # Find new nodes that ARE connected to old nodes via this
+        # phase's original edges (in either direction)
+        connected_new: set = set()
+        for e in phase["newOriginalEdges"]:
+            if e["from"] in old_node_ids and e["to"] in new_node_ids:
+                connected_new.add(e["to"])
+            if e["to"] in old_node_ids and e["from"] in new_node_ids:
+                connected_new.add(e["from"])
 
-        def fmt_params(params):
-            parts = []
-            for p in params:
-                if isinstance(p, dict):
-                    parts.append(f"{p.get('name','?')} - {p.get('type','?')}")
-                else:
-                    parts.append(str(p))
-            return ", ".join(parts)
+        # Build a lookup of recovery-edge name → from-node from all
+        # prior iterations
+        prev_recovery_by_name: dict = {}
+        for prev_phase in all_phases[:pi]:
+            for re in prev_phase["recoveryEdges"]:
+                prev_recovery_by_name[re["label"]] = re
 
-        adds = fmt_atoms(op.get('nominal_add', []))
-        dels = fmt_atoms(op.get('nominal_del', []))
-        preconds = fmt_atoms(op.get('precondition_atoms', []))
-        params = fmt_params(op.get('parameters', []))
+        # For each new orphan source-node, trace its outgoing edge's
+        # action back to a prior recovery edge and add a provenance link
+        provenance: list = []
+        added: set = set()
+        for e in phase["newOriginalEdges"]:
+            from_id = e["from"]
+            if from_id not in new_node_ids:
+                continue                       # old node, already connected
+            if from_id in connected_new:
+                continue                       # already has a link to old
+            if from_id in added:
+                continue                       # already handled
+            action = e.get("action", "")
+            if action in prev_recovery_by_name:
+                prev_re = prev_recovery_by_name[action]
+                provenance.append({
+                    "from": prev_re["from"],   # iter-(k-1) sink-node
+                    "to": from_id,
+                    "label": action,
+                    "title": (f"Provenance: {action}<br>"
+                              f"Precondition state explored in iter {phase['iteration']}"),
+                    "originAction": action,
+                })
+                added.add(from_id)
 
-        recovery_edges_js.append({
-            "from": from_node,
-            "to": to_node,
-            "label": op["name"],
-            "title": (
-                f"<b>Recovery #{i+1}:</b> {op['name']}<br>"
-                f"Δ={op['delta']} | {from_node} → {to_node}<br>"
-                f"Params: ({params})<br>"
-                f"Pre: {', '.join(preconds) if preconds else '(none)'}<br>"
-                f"Add: {', '.join(adds) if adds else '(none)'}<br>"
-                f"Del: {', '.join(dels) if dels else '(none)'}"
-            ),
-            "delta": op["delta"],
-            "iteration": i + 1,
-            "sink_scc": op.get("sink_scc", -1),
-            "source_scc": op.get("source_scc", -1),
-        })
+        # Second pass: handle completely isolated new nodes (zero edges
+        # in the graph) by linking to the most-similar prior-iteration
+        # node via Jaccard similarity on their true-predicate sets.
+        # Build a label→id map for nodes from prior iterations.
+        if pi > 0:
+            # Gather all nodes that are now connected (old + connected-new + provenance targets)
+            all_connected = old_node_ids | connected_new | added
+            # Also mark nodes reachable from provenance targets via new edges
+            # (descendants in the same orphan cluster are connected transitively)
+            changed = True
+            while changed:
+                changed = False
+                for e in phase["newOriginalEdges"]:
+                    if e["from"] in all_connected and e["to"] not in all_connected:
+                        all_connected.add(e["to"])
+                        changed = True
+                    if e["to"] in all_connected and e["from"] not in all_connected:
+                        all_connected.add(e["from"])
+                        changed = True
 
-    # ── Action categories for legend ──
-    action_names = sorted(set(e["action"] for e in original_edges_js))
+            still_isolated = new_node_ids - all_connected
+            if still_isolated:
+                # Build predicate-set map for old nodes
+                old_node_preds: dict = {}
+                for prev_phase in all_phases[:pi]:
+                    for n in prev_phase["newNodes"]:
+                        # Parse true predicates from the title
+                        title = n.get("title", "")
+                        m = _re.search(r"<b>True:</b>\s*(.+?)(?:<br>|$)", title)
+                        if m:
+                            preds = frozenset(p.strip() for p in m.group(1).split(","))
+                        else:
+                            preds = frozenset()
+                        old_node_preds[n["id"]] = preds
 
-    nodes_json = json.dumps(nodes_js)
-    original_edges_json = json.dumps(original_edges_js)
-    recovery_edges_json = json.dumps(recovery_edges_js)
+                # Build predicate-set map for isolated new nodes
+                for iso_id in still_isolated:
+                    iso_node = next((n for n in phase["newNodes"] if n["id"] == iso_id), None)
+                    if not iso_node:
+                        continue
+                    title = iso_node.get("title", "")
+                    m = _re.search(r"<b>True:</b>\s*(.+?)(?:<br>|$)", title)
+                    iso_preds = frozenset(p.strip() for p in m.group(1).split(",")) if m else frozenset()
+
+                    # Find best match by Jaccard similarity
+                    best_id, best_sim = None, -1.0
+                    for old_id, old_preds in old_node_preds.items():
+                        if not iso_preds and not old_preds:
+                            sim = 0.0
+                        else:
+                            inter = len(iso_preds & old_preds)
+                            union = len(iso_preds | old_preds)
+                            sim = inter / union if union else 0.0
+                        if sim > best_sim:
+                            best_sim = sim
+                            best_id = old_id
+
+                    if best_id:
+                        provenance.append({
+                            "from": best_id,
+                            "to": iso_id,
+                            "label": f"≈ nearest",
+                            "title": (f"Provenance: nearest match (Jaccard={best_sim:.2f})<br>"
+                                      f"Isolated state discovered in iter {phase['iteration']}"),
+                            "originAction": "__isolated__",
+                        })
+
+        phase["provenanceEdges"] = provenance
+
+    # Flatten for legacy code paths
+    all_nodes_js = []
+    for phase in all_phases:
+        all_nodes_js.extend(phase["newNodes"])
+    all_original_edges_js = []
+    for phase in all_phases:
+        all_original_edges_js.extend(phase["newOriginalEdges"])
+    all_recovery_edges_js = []
+    for phase in all_phases:
+        all_recovery_edges_js.extend(phase["recoveryEdges"])
+
+    phases_json = json.dumps(all_phases)
+    nodes_json = json.dumps(all_nodes_js)
+    original_edges_json = json.dumps(all_original_edges_js)
+    recovery_edges_json = json.dumps(all_recovery_edges_js)
     num_sccs_initial = condensation.get("num_sccs", len(graph.nodes))
     sources_initial = augmentation.get("sources", [])
     sinks_initial = augmentation.get("sinks", [])
@@ -1092,6 +1309,35 @@ def generate_html(data: dict) -> str:
     color: #8b949e;
     margin-left: 4px;
   }}
+  .event .phase-badge {{
+    display: inline-block;
+    border-radius: 10px;
+    padding: 1px 7px;
+    font-size: 10px;
+    margin-left: 4px;
+    font-weight: 600;
+  }}
+  .event .phase-badge.p1 {{
+    background: rgba(56,203,207,0.15);
+    color: #38cbcf;
+    border: 1px solid rgba(56,203,207,0.3);
+  }}
+  .event .phase-badge.p2 {{
+    background: rgba(240,136,62,0.15);
+    color: #f0883e;
+    border: 1px solid rgba(240,136,62,0.3);
+  }}
+  .event-section-header {{
+    padding: 6px 10px;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: #8b949e;
+    border-bottom: 1px solid #21262d;
+  }}
+  .event-section-header.phase1 {{ color: #38cbcf; }}
+  .event-section-header.phase2 {{ color: #f0883e; }}
 
   /* SCC meter */
   .scc-meter {{
@@ -1537,6 +1783,10 @@ def generate_html(data: dict) -> str:
         </div>
         <span>Recovery = deterministic synthesis</span>
       </div>
+      <div class="legend-item" style="margin-top:6px;">
+        <div class="legend-swatch" style="background: #6e7681;"></div>
+        <span>Provenance (operator origin link)</span>
+      </div>
     </div>
 
     <!-- ── Object Types ── -->
@@ -1597,7 +1847,7 @@ def generate_html(data: dict) -> str:
     </div>
 
     <div class="panel">
-      <h3>Recovery Steps ({len(operators)} total)</h3>
+      <h3>Recovery Steps ({len(all_recovery_edges_js)} total, {len(all_phases)} iterations)</h3>
     </div>
     <div class="event-log" id="event-log">
       <!-- populated by JS -->
@@ -1608,21 +1858,19 @@ def generate_html(data: dict) -> str:
 <div class="timeline">
   <button class="play-btn" id="play-btn" onclick="togglePlay()">▶ Play</button>
   <label>Step:</label>
-  <input type="range" id="timeline-slider" min="0" max="{len(operators) + 1}" value="0">
-  <div class="step-label" id="step-label">Step 2: Original graph</div>
+  <input type="range" id="timeline-slider" min="0" max="0" value="0">
+  <div class="step-label" id="step-label">Iter 1: Original graph</div>
 </div>
 
 <script>
 // ═══════════════════════════════════════════════════════════════
-//  Data
+//  Data  (multi-iteration phases)
 // ═══════════════════════════════════════════════════════════════
-const nodesData = {nodes_json};
-const originalEdges = {original_edges_json};
-const recoveryEdges = {recovery_edges_json};
-const NUM_SCCS_INITIAL = {num_sccs_initial};
+const phases       = {phases_json};
+const NUM_SCCS_INI = {num_sccs_initial};
 
 // ═══════════════════════════════════════════════════════════════
-//  Color scheme
+//  Color helpers
 // ═══════════════════════════════════════════════════════════════
 const SCC_COLORS = [
   '#6baed6','#fd8d3c','#74c476','#9e9ac8','#e377c2','#bcbd22',
@@ -1630,8 +1878,8 @@ const SCC_COLORS = [
   '#e7ba52','#aec7e8','#ffbb78','#98df8a','#c5b0d5','#f7b6d2',
   '#c7c7c7','#dbdb8d','#9edae5','#393b79','#637939','#8c6d31'
 ];
-
-function recoveryEdgeColor(delta) {{
+function sccColor(idx)  {{ return SCC_COLORS[idx % SCC_COLORS.length]; }}
+function recColor(delta) {{
   if (delta === 0) return '#f0883e';
   if (delta === 1) return '#d2a8ff';
   if (delta === 2) return '#7ee787';
@@ -1640,34 +1888,30 @@ function recoveryEdgeColor(delta) {{
 }}
 
 // ═══════════════════════════════════════════════════════════════
-//  Build vis.js DataSets
+//  Build flat timeline from phases
+//  Each entry: {{ type, phaseIdx, ... }}
+//    type='graph'    → show phase's new nodes + original edges
+//    type='recovery' → add one recovery edge (recIdx into phase)
+//    type='done'     → final converged marker
 // ═══════════════════════════════════════════════════════════════
-const nodes = new vis.DataSet(nodesData.map(n => ({{
-  id: n.id,
-  label: n.label,
-  title: n.title,
-  group: n.group,
-  color: {{
-    background: SCC_COLORS[n.scc % SCC_COLORS.length],
-    border: '#fff',
-    highlight: {{ background: '#fff', border: SCC_COLORS[n.scc % SCC_COLORS.length] }}
-  }},
-  font: {{ color: '#c9d1d9', size: 10 }},
-  shape: 'dot',
-  size: 14,
-  borderWidth: 1.5,
-}})));
+const timeline = [];
+phases.forEach((ph, pi) => {{
+  timeline.push({{ type: 'graph', phaseIdx: pi }});
+  ph.recoveryEdges.forEach((_, ri) => {{
+    timeline.push({{ type: 'recovery', phaseIdx: pi, recIdx: ri }});
+  }});
+}});
+timeline.push({{ type: 'done' }});
 
+const TOTAL_STEPS = timeline.length;   // 0 … TOTAL_STEPS-1
+
+// ═══════════════════════════════════════════════════════════════
+//  vis.js DataSets (start empty)
+// ═══════════════════════════════════════════════════════════════
+const nodes = new vis.DataSet();
 const edges = new vis.DataSet();
-
-// Edge ID counters
 let edgeId = 0;
-const originalEdgeIds = [];
-const recoveryEdgeIds = [];
 
-// ═══════════════════════════════════════════════════════════════
-//  Network
-// ═══════════════════════════════════════════════════════════════
 const container = document.getElementById('graph-container');
 const network = new vis.Network(container, {{ nodes, edges }}, {{
   physics: {{
@@ -1686,235 +1930,274 @@ const network = new vis.Network(container, {{ nodes, edges }}, {{
     smooth: {{ type: 'curvedCW', roundness: 0.15 }},
     font: {{ size: 9, color: '#8b949e', strokeWidth: 0, align: 'top' }},
   }},
-  nodes: {{
-    font: {{ color: '#c9d1d9', size: 10 }},
-  }},
-  interaction: {{
-    hover: true,
-    tooltipDelay: 100,
-    zoomView: true,
-    dragView: true,
-  }},
+  nodes: {{ font: {{ color: '#c9d1d9', size: 10 }} }},
+  interaction: {{ hover: true, tooltipDelay: 100, zoomView: true, dragView: true }},
 }});
 
 // ═══════════════════════════════════════════════════════════════
-//  State management
+//  SCC timeline (computed over the flat timeline)
 // ═══════════════════════════════════════════════════════════════
-let currentStep = -1;  // -1 = nothing shown
-
-// SCC tracking: we recalculate when recovery edges are added
-// For visualization, we track how many SCCs merge at each step
-// Pre-computed: simulate the SCC collapse
 function computeSCCTimeline() {{
-  // Build adjacency at each step
-  const adj = new Map();
-  nodesData.forEach(n => adj.set(n.id, new Set()));
+  // Gather ALL node ids across all phases
+  const allNodeIds = [];
+  phases.forEach(ph => ph.newNodes.forEach(n => allNodeIds.push(n.id)));
 
-  // Add original edges
-  originalEdges.forEach(e => {{
-    adj.get(e.from)?.add(e.to);
-  }});
+  const adj = new Map();
+  const ensureNode = (id) => {{ if (!adj.has(id)) adj.set(id, new Set()); }};
 
   const countSCCs = () => {{
+    const nodeIds = [...adj.keys()];
+    if (nodeIds.length === 0) return 0;
     const visited = new Set();
     const finished = [];
-    const nodeIds = nodesData.map(n => n.id);
-
-    // DFS for Kosaraju's
     const dfs1 = (u) => {{
       visited.add(u);
-      for (const v of (adj.get(u) || [])) {{
-        if (!visited.has(v)) dfs1(v);
-      }}
+      for (const v of (adj.get(u) || [])) {{ if (!visited.has(v)) dfs1(v); }}
       finished.push(u);
     }};
-
-    // Reverse graph
     const radj = new Map();
     nodeIds.forEach(n => radj.set(n, new Set()));
-    for (const [u, neighbors] of adj) {{
-      for (const v of neighbors) {{
-        radj.get(v)?.add(u);
-      }}
-    }}
-
+    for (const [u, nbrs] of adj) {{ for (const v of nbrs) {{ radj.get(v)?.add(u); }} }}
     const dfs2 = (u, comp) => {{
       visited.add(u);
       comp.push(u);
-      for (const v of (radj.get(u) || [])) {{
-        if (!visited.has(v)) dfs2(v, comp);
-      }}
+      for (const v of (radj.get(u) || [])) {{ if (!visited.has(v)) dfs2(v, comp); }}
     }};
-
     nodeIds.forEach(n => {{ if (!visited.has(n)) dfs1(n); }});
     visited.clear();
-
     let sccs = 0;
     for (let i = finished.length - 1; i >= 0; i--) {{
-      if (!visited.has(finished[i])) {{
-        const comp = [];
-        dfs2(finished[i], comp);
-        sccs++;
-      }}
+      if (!visited.has(finished[i])) {{ dfs2(finished[i], []); sccs++; }}
     }}
     return sccs;
   }};
 
-  const timeline = [countSCCs()]; // after original edges
-
-  // Add recovery edges one by one
-  recoveryEdges.forEach(re => {{
-    adj.get(re.from)?.add(re.to);
-    timeline.push(countSCCs());
+  const tl = [];
+  timeline.forEach(entry => {{
+    if (entry.type === 'graph') {{
+      const ph = phases[entry.phaseIdx];
+      ph.newNodes.forEach(n => ensureNode(n.id));
+      ph.newOriginalEdges.forEach(e => {{
+        ensureNode(e.from); ensureNode(e.to);
+        adj.get(e.from).add(e.to);
+      }});
+      // Provenance edges also contribute to connectivity
+      (ph.provenanceEdges || []).forEach(e => {{
+        ensureNode(e.from); ensureNode(e.to);
+        adj.get(e.from).add(e.to);
+      }});
+      tl.push(countSCCs());
+    }} else if (entry.type === 'recovery') {{
+      const re = phases[entry.phaseIdx].recoveryEdges[entry.recIdx];
+      ensureNode(re.from); ensureNode(re.to);
+      adj.get(re.from).add(re.to);
+      tl.push(countSCCs());
+    }} else {{
+      tl.push(tl.length > 0 ? tl[tl.length - 1] : 0);
+    }}
   }});
-
-  return timeline;
+  return tl;
 }}
-
 const sccTimeline = computeSCCTimeline();
 
+// ═══════════════════════════════════════════════════════════════
+//  State: track what has been rendered up to currentStep
+// ═══════════════════════════════════════════════════════════════
+let currentStep = -1;
+
+function addVisNode(n) {{
+  if (nodes.get(n.id)) return;   // already present
+  nodes.add({{
+    id: n.id, label: n.label, title: n.title, group: n.group,
+    color: {{
+      background: sccColor(n.scc), border: '#fff',
+      highlight: {{ background: '#fff', border: sccColor(n.scc) }}
+    }},
+    font: {{ color: '#c9d1d9', size: 10 }},
+    shape: 'dot', size: 14, borderWidth: 1.5,
+  }});
+}}
+
+function addOrigEdge(e) {{
+  const id = `e_${{edgeId++}}`;
+  edges.add({{
+    id, from: e.from, to: e.to, label: e.label, title: e.title,
+    color: {{ color: '#58a6ff', highlight: '#79c0ff', opacity: 0.85 }},
+    width: 2, dashes: false,
+  }});
+}}
+
+function addRecEdge(re) {{
+  const id = `r_${{edgeId++}}`;
+  const isP1 = re.phase === 1;
+  const c = isP1 ? '#38cbcf' : recColor(re.delta);
+  edges.add({{
+    id, from: re.from, to: re.to, label: re.label, title: re.title,
+    color: {{ color: c, highlight: '#fff', opacity: 0.9 }},
+    width: isP1 ? 3.0 : 2.5,
+    dashes: isP1 ? [8, 4] : false,
+  }});
+}}
+
+function addProvenanceEdge(pe) {{
+  const id = `p_${{edgeId++}}`;
+  edges.add({{
+    id, from: pe.from, to: pe.to, label: pe.label || '', title: pe.title,
+    color: {{ color: '#6e7681', highlight: '#8b949e', opacity: 0.85 }},
+    font: {{ size: 9, color: '#8b949e', strokeWidth: 0, align: 'top' }},
+    width: 1.5,
+    dashes: false,
+    arrows: {{ to: {{ enabled: true, scaleFactor: 0.5, type: 'arrow' }} }},
+  }});
+}}
+
 function setStep(step) {{
-  // step 0 = original edges only
-  // step 1..N = recovery edges added incrementally
+  step = Math.max(0, Math.min(step, TOTAL_STEPS - 1));
   if (step === currentStep) return;
 
-  const edgesToAdd = [];
-  const edgeIdsToRemove = [];
-
   if (step < currentStep) {{
-    // Going backward: rebuild from scratch
-    edges.clear();
-    originalEdgeIds.length = 0;
-    recoveryEdgeIds.length = 0;
-    edgeId = 0;
-    currentStep = -1;
+    // Going backward → rebuild from scratch
+    nodes.clear(); edges.clear(); edgeId = 0; currentStep = -1;
   }}
 
-  // Add original edges if not yet added
-  if (currentStep < 0 && step >= 0) {{
-    originalEdges.forEach(e => {{
-      const id = `e_${{edgeId++}}`;
-      originalEdgeIds.push(id);
-      edgesToAdd.push({{
-        id,
-        from: e.from,
-        to: e.to,
-        label: e.label,
-        title: e.title,
-        color: {{ color: '#58a6ff', highlight: '#79c0ff', opacity: 0.85 }},
-        width: 2,
-        dashes: false,
-      }});
-    }});
-    currentStep = 0;
+  // Advance from currentStep+1 … step
+  for (let s = currentStep + 1; s <= step; s++) {{
+    const entry = timeline[s];
+    if (entry.type === 'graph') {{
+      const ph = phases[entry.phaseIdx];
+      ph.newNodes.forEach(addVisNode);
+      ph.newOriginalEdges.forEach(addOrigEdge);
+      (ph.provenanceEdges || []).forEach(addProvenanceEdge);
+    }} else if (entry.type === 'recovery') {{
+      const re = phases[entry.phaseIdx].recoveryEdges[entry.recIdx];
+      addRecEdge(re);
+    }}
+    // 'done' → nothing to add
   }}
-
-  // Add recovery edges up to `step`
-  while (currentStep < step && currentStep < recoveryEdges.length) {{
-    const re = recoveryEdges[currentStep]; // 0-indexed
-    const id = `r_${{edgeId++}}`;
-    recoveryEdgeIds.push(id);
-    const c = recoveryEdgeColor(re.delta);
-    edgesToAdd.push({{
-      id,
-      from: re.from,
-      to: re.to,
-      label: re.label,
-      title: re.title,
-      color: {{ color: c, highlight: '#fff', opacity: 0.9 }},
-      width: 2.5,
-      dashes: false,
-    }});
-    currentStep++;
-  }}
-
-  if (step > recoveryEdges.length) currentStep = recoveryEdges.length;
-
-  if (edgesToAdd.length > 0) {{
-    edges.add(edgesToAdd);
-  }}
-
+  currentStep = step;
   updateUI(step);
 }}
 
+// ═══════════════════════════════════════════════════════════════
+//  UI update
+// ═══════════════════════════════════════════════════════════════
 function updateUI(step) {{
-  // Stats
-  const totalEdges = (step >= 0 ? originalEdges.length : 0)
-                   + Math.min(Math.max(step, 0), recoveryEdges.length);
-  document.getElementById('stat-edges').textContent = totalEdges;
+  const entry = timeline[step];
 
-  const sccIdx = Math.min(Math.max(step, 0), sccTimeline.length - 1);
+  // Stats: nodes, edges
+  document.getElementById('stat-edges').textContent = edges.length;
+
+  const sccIdx = Math.min(step, sccTimeline.length - 1);
   const sccs = sccTimeline[sccIdx];
-  document.getElementById('stat-sccs').textContent = sccs;
-  document.getElementById('scc-count').textContent = sccs;
-
-  const pct = (sccs / NUM_SCCS_INITIAL) * 100;
+  document.getElementById('stat-sccs').textContent  = sccs;
+  document.getElementById('scc-count').textContent   = sccs;
+  const pct = (sccs / NUM_SCCS_INI) * 100;
   const bar = document.getElementById('scc-bar');
   bar.style.width = pct + '%';
-  bar.style.background = sccs <= 1 ? '#238636'
-                        : sccs <= 5 ? '#f0883e'
-                        : '#da3633';
+  bar.style.background = sccs <= 1 ? '#238636' : sccs <= 5 ? '#f0883e' : '#da3633';
+
+  // Sources / sinks from the current phase
+  let curPhase = null;
+  for (let i = step; i >= 0; i--) {{
+    if (timeline[i].type === 'graph') {{ curPhase = phases[timeline[i].phaseIdx]; break; }}
+  }}
+  if (curPhase) {{
+    document.getElementById('stat-sources').textContent = curPhase.sources.length;
+    document.getElementById('stat-sinks').textContent   = curPhase.sinks.length;
+  }}
 
   // Step label
   const labelEl = document.getElementById('step-label');
-  if (step <= 0) {{
-    labelEl.textContent = 'Step 2: Original abstract graph';
-    document.getElementById('stat-sources').textContent = '{len(sources_initial)}';
-    document.getElementById('stat-sinks').textContent = '{len(sinks_initial)}';
-  }} else if (step <= recoveryEdges.length) {{
-    const re = recoveryEdges[step - 1];
-    labelEl.textContent = `Recovery #${{step}}: ${{re.label}} (Δ=${{re.delta}})`;
+  if (entry.type === 'graph') {{
+    const ph = phases[entry.phaseIdx];
+    const it = ph.iteration;
+    if (entry.phaseIdx === 0) {{
+      labelEl.textContent = `Iter ${{it}}: Original graph (${{ph.numStates}} states, ${{ph.numEdges}} edges)`;
+    }} else {{
+      labelEl.textContent = `Iter ${{it}}: +${{ph.newNodes.length}} new states, +${{ph.newOriginalEdges.length}} new edges (${{ph.numStates}} total)`;
+    }}
+  }} else if (entry.type === 'recovery') {{
+    const re = phases[entry.phaseIdx].recoveryEdges[entry.recIdx];
+    const it = phases[entry.phaseIdx].iteration;
+    const pLabel = re.phase === 1 ? 'Phase 1 (MWCC)' : 'Phase 2 (Reachability)';
+    labelEl.textContent = `Iter ${{it}} ${{pLabel}}: ${{re.label}} (Δ=${{re.delta}})`;
   }} else {{
-    labelEl.textContent = '✓ Graph is irreducible (1 SCC)';
+    labelEl.textContent = '✓ Converged — graph is irreducible';
   }}
 
-  // Event log highlighting
+  // Event-log highlighting
   document.querySelectorAll('.event').forEach((el, i) => {{
     el.classList.remove('active', 'past');
     if (i < step) el.classList.add('past');
     else if (i === step) el.classList.add('active');
   }});
-
-  // Scroll active event into view
   const activeEl = document.querySelector('.event.active');
   if (activeEl) activeEl.scrollIntoView({{ block: 'nearest', behavior: 'smooth' }});
 }}
 
 // ═══════════════════════════════════════════════════════════════
-//  Event log
+//  Event log  (one entry per timeline step)
 // ═══════════════════════════════════════════════════════════════
-const logEl = document.getElementById('event-log');
+const logEl  = document.getElementById('event-log');
+const slider = document.getElementById('timeline-slider');
 
-// Step 0: original
-const ev0 = document.createElement('div');
-ev0.className = 'event';
-ev0.innerHTML = `<span class="step-num">0</span> Original graph: ${{originalEdges.length}} edges, ${{nodesData.length}} states`;
-ev0.onclick = () => {{ slider.value = 0; setStep(0); }};
-logEl.appendChild(ev0);
+// Track when we need to insert phase section headers
+let lastPhaseTag = '';
 
-// Recovery steps
-recoveryEdges.forEach((re, i) => {{
+timeline.forEach((entry, idx) => {{
+  // Insert section headers at Phase 1 / Phase 2 boundaries
+  if (entry.type === 'recovery') {{
+    const re = phases[entry.phaseIdx].recoveryEdges[entry.recIdx];
+    const ph = phases[entry.phaseIdx];
+    const tag = `iter${{ph.iteration}}_p${{re.phase}}`;
+    if (tag !== lastPhaseTag) {{
+      const hdr = document.createElement('div');
+      hdr.className = 'event-section-header ' + (re.phase === 1 ? 'phase1' : 'phase2');
+      if (re.phase === 1) {{
+        hdr.textContent = `⛓ Phase 1: MWCC (${{ph.numWCCs}} WCCs)`;
+      }} else {{
+        hdr.textContent = `⚡ Phase 2: Reachability Closure`;
+      }}
+      logEl.appendChild(hdr);
+      lastPhaseTag = tag;
+    }}
+  }}
+
   const ev = document.createElement('div');
   ev.className = 'event';
-  ev.innerHTML = `<span class="step-num">${{i+1}}</span> `
-    + `<span class="op-name">${{re.label}}</span>`
-    + `<span class="delta-badge">Δ=${{re.delta}}</span>`
-    + `<br><span style="color:#8b949e;font-size:11px;">SCC-${{re.sink_scc}} → SCC-${{re.source_scc}}</span>`;
-  ev.onclick = () => {{ slider.value = i + 1; setStep(i + 1); }};
+
+  if (entry.type === 'graph') {{
+    const ph = phases[entry.phaseIdx];
+    const it = ph.iteration;
+    if (entry.phaseIdx === 0) {{
+      ev.innerHTML = `<span class="step-num">${{idx}}</span> `
+        + `<b style="color:#58a6ff;">Iter ${{it}}</b> — Original: ${{ph.numStates}} states, ${{ph.numEdges}} edges`;
+    }} else {{
+      ev.innerHTML = `<span class="step-num">${{idx}}</span> `
+        + `<b style="color:#58a6ff;">Iter ${{it}}</b> — +${{ph.newNodes.length}} states, +${{ph.newOriginalEdges.length}} edges (${{ph.numStates}} total)`;
+    }}
+    lastPhaseTag = '';  // reset on new graph phase
+  }} else if (entry.type === 'recovery') {{
+    const re = phases[entry.phaseIdx].recoveryEdges[entry.recIdx];
+    const pClass = re.phase === 1 ? 'p1' : 'p2';
+    const pText  = re.phase === 1 ? 'P1' : 'P2';
+    ev.innerHTML = `<span class="step-num">${{idx}}</span> `
+      + `<span class="op-name">${{re.label}}</span>`
+      + `<span class="delta-badge">Δ=${{re.delta}}</span>`
+      + `<span class="phase-badge ${{pClass}}">${{pText}}</span>`
+      + `<br><span style="color:#8b949e;font-size:11px;">SCC-${{re.sink_scc}} → SCC-${{re.source_scc}}</span>`;
+  }} else {{
+    ev.innerHTML = `<span class="step-num">✓</span> <b style="color:#238636;">Converged</b> — irreducible`;
+  }}
+
+  ev.onclick = () => {{ slider.value = idx; setStep(idx); }};
   logEl.appendChild(ev);
 }});
-
-// Final
-const evF = document.createElement('div');
-evF.className = 'event';
-evF.innerHTML = `<span class="step-num">✓</span> <b style="color:#238636;">Irreducible</b> — 1 SCC`;
-evF.onclick = () => {{ slider.value = recoveryEdges.length + 1; setStep(recoveryEdges.length + 1); }};
-logEl.appendChild(evF);
 
 // ═══════════════════════════════════════════════════════════════
 //  Slider
 // ═══════════════════════════════════════════════════════════════
-const slider = document.getElementById('timeline-slider');
+slider.max = TOTAL_STEPS - 1;
 slider.addEventListener('input', () => setStep(parseInt(slider.value)));
 
 // ═══════════════════════════════════════════════════════════════
@@ -1943,18 +2226,13 @@ function togglePlay() {{
     playing = true;
     btn.textContent = '⏸ Pause';
     btn.classList.add('paused');
-    if (parseInt(slider.value) >= recoveryEdges.length + 1) {{
-      slider.value = 0;
-      setStep(0);
+    if (parseInt(slider.value) >= TOTAL_STEPS - 1) {{
+      slider.value = 0; setStep(0);
     }}
     playInterval = setInterval(() => {{
       const v = parseInt(slider.value) + 1;
-      if (v > recoveryEdges.length + 1) {{
-        togglePlay();
-        return;
-      }}
-      slider.value = v;
-      setStep(v);
+      if (v >= TOTAL_STEPS) {{ togglePlay(); return; }}
+      slider.value = v; setStep(v);
     }}, 1200);
   }}
 }}
@@ -1998,10 +2276,16 @@ def main():
     with open(out_path, "w") as f:
         f.write(html)
 
+    iterations_data = data.get("iterations_data", [])
+    total_nodes = sum(len(it.get("graph", nx.DiGraph()).nodes) for it in iterations_data) if iterations_data else len(data["graph"].nodes)
+    total_recovery = sum(len(it.get("operators", [])) for it in iterations_data) if iterations_data else len(data.get("operators", []))
+    last_graph = iterations_data[-1].get("graph", data["graph"]) if iterations_data else data["graph"]
+
     print(f"✓ Evolution visualization saved to: {out_path}")
-    print(f"  Nodes: {len(data['graph'].nodes)}")
-    print(f"  Original edges: {len(data['graph'].edges)}")
-    print(f"  Recovery edges: {len(data.get('operators', []))}")
+    print(f"  Iterations: {len(iterations_data)}")
+    print(f"  Final states: {len(last_graph.nodes)}  (iter1: {len(data['graph'].nodes)})")
+    print(f"  Final edges:  {len(last_graph.edges)}")
+    print(f"  Recovery ops: {total_recovery}")
 
 
 if __name__ == "__main__":

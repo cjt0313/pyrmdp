@@ -52,7 +52,7 @@ class PipelineConfig:
     """Probability assigned to the failure branch of each action."""
 
     # ── Step 2: Abstract State Pruning ────────────────────────────
-    enable_mutex_pruning: bool = False
+    enable_mutex_pruning: bool = True
     """Enable R5 (LLM-based mutex pruning) after abstract state enumeration."""
 
     # ── Step 5: Delta Minimization ───────────────────────────────

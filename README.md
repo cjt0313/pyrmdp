@@ -260,34 +260,66 @@ Identify structural deficiencies in the condensation DAG.
 
 **Module:** `synthesis/delta_minimizer.py`
 
-Iteratively synthesize recovery operators to bridge sink → source SCC pairs, making the graph strongly connected. Recovery operators are computed **deterministically** from the predicate delta — no LLM call required.
+Synthesize recovery operators to make the abstract graph strongly connected (irreducible). Recovery operators are computed **deterministically** from the predicate delta — no LLM call required. The algorithm uses a **monotonic cycle-closing loop** with **Minimum Weight Cycle Cover (MWCC)** for inter-component routing and **reachability-based cycle closure** for intra-component merging.
 
 | | |
 |---|---|
-| **Input** | Abstract graph, `Domain`, condensation DAG |
+| **Input** | Abstract graph, `Domain` |
 | **LLM Task** | *None* — fully deterministic |
 | **Output** | `DeltaMinimizationResult` — synthesized operators + updated graph |
 
-**Algorithm:**
-1. **Candidate generation:** For each (sink, source) pair, compute the **logical Hamming distance** (predicate delta) and topological gain
-2. **Scoring:** Rank candidates by α·(1 − norm_delta) + β·(norm_gain), default α=0.7, β=0.3
-3. **Synthesis loop** (up to `max_delta_iterations`):
-   - Pick the top-scored candidate
-   - **Deterministically compute** a recovery operator:
-     - **Effects** — `must_add = source_true − sink_true`, `must_del = sink_true − source_true` (the predicate delta)
-     - **Variable Unification** — each bare predicate name is looked up in the domain's `:predicates` and grounded using the domain's canonical variable names (e.g. `holding` → `(holding ?r - robot ?x - movable)`). Predicates sharing a variable name (like `?r`) are automatically unified.
-     - **Minimal Causal Preconditions** — only sink-state predicates that share ≥1 unified variable with the delta effects are included in the precondition. Unrelated predicates (e.g. `stove-on` when the delta is about `holding`) are discarded.
-     - **Single deterministic effect** — probability 1.0, no failure branch, no numeric rewards. Failure branches are injected by Step 1 (hallucination) in the next iteration; rewards are injected by Step 6 (PPDDL emission).
-   - Convert to `ActionSchema` and add to the domain + graph
-   - Re-condense and re-evaluate
-   - Stop when the DAG collapses to a single SCC (irreducible)
+#### Algorithm 1 — Main Augmentation Loop (`_compute_augmentation_edges`)
+
+A monotonic `while True` loop that terminates when a single SCC remains:
+
+1. Build `H_raw = G + accumulated_meta_edges`, condense to `H = nx.condensation(H_raw)`
+2. If `|H.nodes| == 1` → done
+3. If `|WCCs| > 1` → call MWCC (Algorithm 2) to merge WCCs
+4. If `|WCCs| == 1` → call Reachability Closure (Algorithm 3) to merge SCCs
+5. Repeat
+
+**Monotonic convergence:** Each iteration reduces either `|WCCs|` or `|SCCs|` by ≥ 1, so the loop terminates in at most `|V|` steps.
+
+#### Algorithm 2 — Inter-WCC MWCC (`_build_global_cycle_across_wccs`)
+
+*Goal:* Merge all `k` WCCs into a single weakly connected graph at minimum total Hamming cost.
+
+1. Extract sinks/sources per WCC
+2. Build a `k×k` cost matrix `C[i,j]` = min-distance bridge from a sink of WCC_i to a source of WCC_j (∞ on diagonal)
+3. Solve with `scipy.optimize.linear_sum_assignment(C)` → minimum-weight successor permutation (Hungarian algorithm, O(k³))
+4. **Cycle patching:** merge disjoint permutation cycles into one Hamiltonian cycle by swapping successors
+5. Return witness edges `(u*, v*)` for each arc in the global cycle
+
+#### Algorithm 3 — Intra-WCC Reachability Closure (`_close_one_reachable_source_sink_cycle`)
+
+*Goal:* Reduce the SCC count by 1 within a single WCC.
+
+1. Find all sources (in-degree 0) and sinks (out-degree 0) in the condensation `H`
+2. For each source `s`, compute `nx.descendants(H, s)` to find reachable sinks
+3. For each valid `(s, t)` pair where `s` reaches `t`, compute `_best_original_bridge(t, s)` — the edge goes FROM sink TO source (closing a directed cycle)
+4. Pick the `(t, s)` pair with absolute minimum Hamming distance
+5. Return that single witness edge
+
+#### Operator Synthesis (`_lift_to_operator`)
+
+For each `(sink_state, source_state)` pair returned by the augmentation loop:
+- **Effects** — `must_add = source_true − sink_true`, `must_del = sink_true − source_true`
+- **Variable Unification** — each bare predicate name is looked up in the domain's `:predicates` and grounded using the domain's canonical variable names
+- **Minimal Causal Preconditions** — only sink-state predicates that share ≥ 1 unified variable with the delta effects
+- **Single deterministic effect** — probability 1.0, no failure branch, no numeric rewards
 
 **Logical Hamming Distance** counts predicates that must change truth value:
 ```
 Δ(U, V) = |T_U ∩ F_V| + |F_U ∩ T_V| + |T_V \ (T_U ∪ F_U)| + |F_V \ (T_U ∪ F_U)|
 ```
 
-**Why deterministic?** The precondition and effect are fully determined by the abstract state pair — there is nothing for the LLM to invent. Step 5 now runs **instantly** (no HTTP requests), making the overall pipeline significantly faster.
+**Stats output** (`iter*_step5_stats.json`): `phase1_ops` (MWCC edges), `phase2_ops` (reachability edges), `num_wccs`.
+
+**Why MWCC?** The Hungarian algorithm finds the minimum-cost perfect matching in O(k³), provably optimal for the inter-component routing subproblem. The cycle patching step merges any disjoint permutation cycles into a single Hamiltonian cycle over WCCs.
+
+**Why reachability closure?** By only adding edges where the source already reaches the sink in the DAG, each added edge is guaranteed to close a directed cycle and merge ≥ 2 SCCs into 1 — no wasted edges.
+
+**Why deterministic?** The precondition and effect are fully determined by the abstract state pair — there is nothing for the LLM to invent. Step 5 runs **instantly** (no HTTP requests), making the overall pipeline significantly faster.
 
 ---
 
@@ -418,6 +450,7 @@ pyrmdp/
 │   ├── run_pipeline.py                  # End-to-end pipeline (Steps 0–6) CLI
 │   ├── run_all_testdata.py              # Batch runner — all test cases in parallel
 │   ├── run_experiment1_convergence.py   # Experiment 1 — spectral convergence budget sweep
+│   ├── visualize_evolution.py           # Interactive HTML evolution graph (vis.js)
 │   ├── plot_convergence.py              # Publication-quality convergence plots
 │   ├── plot_metrics_comparison.py       # 3-metric (cosine/L2/Wasserstein) comparison plot
 │   ├── generate_add.py                  # Build & visualize an FODD from PPDDL
@@ -697,6 +730,32 @@ python scripts/generate_markov.py
 
 Both produce interactive `.html` files viewable in a browser.
 
+### 5.6 Evolution Graph Visualization
+
+```bash
+python scripts/visualize_evolution.py pyrmdp/test_data/1/output_batch
+```
+
+Generates a single-page interactive HTML graph (vis.js) showing the full
+pipeline evolution across iterations — abstract states, original
+transitions, recovery operators, and provenance traces.
+
+**Visual encoding:**
+
+| Element | Style | Meaning |
+|---------|-------|---------|
+| Solid coloured node | — | Abstract state (hue = iteration) |
+| Dark edge | Solid, dark grey | Original domain transition |
+| Cyan dashed edge | Dashed, `#38cbcf` | Phase 1 recovery (MWCC) |
+| Coloured solid edge | Solid, hue-mapped | Phase 2 recovery (reachability closure); colour = Hamming delta |
+| Grey solid edge | Solid, `#6e7681` | Provenance trace (links orphan iter-2 nodes to iter-1 origins) |
+
+**Features:**
+- **Step slider** — scrub through the timeline of operators added per iteration
+- **SCC timeline** — highlights which SCCs exist at each step
+- **Event log** — sidebar listing each operator with `P1`/`P2` badge and section headers (`⛓ Phase 1`, `⚡ Phase 2`)
+- **Provenance edges** — two mechanisms: *operator-traced* (action name → prior recovery edge) and *Jaccard fallback* (most similar prior node for fully isolated nodes)
+
 #### Intermediate Outputs (`--save-intermediates`)
 
 | File | Step | Content |
@@ -710,8 +769,9 @@ Both produce interactive `.html` files viewable in a browser.
 | `iter{N}_step3_dag.graphml` | 3 | Condensation DAG |
 | `iter{N}_step4_augmentation_bound.json` | 4 | Sources, sinks, MSCA bound |
 | `iter{N}_step5_synthesized_operators.json` | 5 | Synthesized recovery operators |
-| `iter{N}_step5_stats.json` | 5 | Delta minimization statistics |
+| `iter{N}_step5_stats.json` | 5 | Delta minimization statistics (phase1_ops, phase2_ops, num_wccs) |
 | `pipeline_summary.json` | — | Convergence diagnostics, timings, spectral distances |
+| `evolution_graph.html` | — | Interactive vis.js evolution graph (generated by `visualize_evolution.py`) |
 
 ---
 
