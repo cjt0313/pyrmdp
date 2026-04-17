@@ -41,6 +41,11 @@ from .graph_analysis import (
     condense_to_dag,
     get_scc_representative_predicates,
 )
+from .prompts.llm_feasibility_prompt import (
+    build_feasibility_prompt,
+    build_unroll_prompt,
+    parse_feasibility_response,
+)
 
 # pyPPDDL data model
 try:
@@ -72,6 +77,19 @@ class ScoringConfig:
     max_candidates_per_iter: int = 10  # Candidates to try per iteration
     delta_threshold: int = 15       # Max predicates LLM can handle
     max_recovery_per_iter: Optional[int] = None  # Budget cap (None = unlimited)
+
+    # ── LLM Feasibility Gate ──
+    enable_llm_feasibility: bool = False
+    """When True, Hamming-optimal bridge candidates are validated by an
+    LLM physics gate before being accepted.  Default False preserves
+    the pure deterministic MSCA/MWCC algorithm."""
+
+    feasibility_k: int = 5
+    """Number of top-k Hamming candidates to send to the LLM per bridge."""
+
+    feasibility_lambda: float = 0.5
+    """Blending weight λ for the LLM rank penalty:
+    C'[e] = d_ham(e) + λ · (rank(e) - 1) / k."""
 
 
 @dataclass
@@ -109,6 +127,7 @@ class SynthesizedOperator:
     delta: int = 0
     sink_node: str = ""
     source_node: str = ""
+    phase_tag: str = ""
     action_schema: Optional[ActionSchema] = None
 
 
@@ -432,50 +451,260 @@ def _dist(
 #  Best Original Bridge
 # ════════════════════════════════════════════════════════════════════
 
+def _get_state_preds(
+    node: str, original_graph: nx.DiGraph,
+) -> Tuple[set, set]:
+    """Return (true_predicates, false_predicates) for a graph node."""
+    state = original_graph.nodes[node].get("state")
+    if state is None:
+        return set(), set()
+    return set(state.true_predicates), set(state.false_predicates)
+
+
+# ── Module-level buffer for extra unrolled hops ──
+_unroll_extra_edges: List[Tuple[str, str, float]] = []
+
+
+def evaluate_candidates(
+    sink_node: str,
+    source_nodes: List[str],
+    original_graph: nx.DiGraph,
+    llm_fn,
+    mutex_groups: Optional[List[Any]],
+    k: int,
+    lambda_penalty: float,
+) -> Optional[Tuple[str, str, float]]:
+    """Hamming Proposes, LLM Grounds — evaluate top-k candidates.
+
+    1. Rank *source_nodes* by Hamming distance to *sink_node*.
+    2. Take top-k, send to LLM for feasibility + ranking.
+    3. Return the best feasible candidate with calibrated cost
+       ``C' = d_ham + λ·(rank-1)/k``, or *None* if all infeasible.
+    """
+    # Score all candidates by Hamming
+    scored = []
+    for v in source_nodes:
+        d = _dist(sink_node, v, original_graph, mutex_groups)
+        if d < float("inf"):
+            scored.append((d, v))
+    scored.sort()
+    top_k = scored[:k]
+    if not top_k:
+        return None
+
+    sink_true, sink_false = _get_state_preds(sink_node, original_graph)
+
+    candidates_for_prompt = []
+    for idx, (d, v) in enumerate(top_k):
+        v_true, v_false = _get_state_preds(v, original_graph)
+        candidates_for_prompt.append({
+            "candidate_id": idx,
+            "source_node": v,
+            "source_true": sorted(v_true),
+            "source_false": sorted(v_false),
+            "delta": d,
+        })
+
+    prompt = build_feasibility_prompt(
+        sink_true=sorted(sink_true),
+        sink_false=sorted(sink_false),
+        candidates=candidates_for_prompt,
+    )
+
+    try:
+        raw = llm_fn(prompt["user"], system=prompt["system"])
+        parsed = parse_feasibility_response(raw, len(top_k))
+    except Exception as exc:
+        logger.warning(f"LLM feasibility call failed: {exc}; falling back to Hamming")
+        # Fall back: return Hamming-best
+        d, v = top_k[0]
+        return sink_node, v, d
+
+    # Find best feasible by calibrated cost
+    best: Optional[Tuple[str, str, float]] = None
+    best_cost = float("inf")
+    for entry in parsed:
+        cid = entry["candidate_id"]
+        if not entry["is_feasible"] or cid >= len(top_k):
+            continue
+        d, v = top_k[cid]
+        rank = entry.get("rank", cid + 1)
+        calibrated = d + lambda_penalty * (rank - 1) / max(k, 1)
+        if calibrated < best_cost:
+            best_cost = calibrated
+            best = (sink_node, v, calibrated)
+
+    return best
+
+
+def unroll_transition(
+    sink_node: str,
+    source_nodes: List[str],
+    original_graph: nx.DiGraph,
+    llm_fn,
+    mutex_groups: Optional[List[Any]],
+    k: int,
+) -> List[Tuple[str, str, float]]:
+    """Structural Graph Unrolling — find 2-hop path via intermediate.
+
+    For each candidate source v, find intermediate c ∈ V such that
+    sink→c→v is physically plausible.  Returns a list of edges
+    (may be empty if no unrolling found).
+    """
+    sink_true, sink_false = _get_state_preds(sink_node, original_graph)
+
+    # Collect candidate paths: sink → c → v
+    paths = []
+    all_nodes = sorted(original_graph.nodes())
+    scored_sources = []
+    for v in source_nodes:
+        d = _dist(sink_node, v, original_graph, mutex_groups)
+        if d < float("inf"):
+            scored_sources.append((d, v))
+    scored_sources.sort()
+    top_sources = scored_sources[:k]
+
+    for _, v in top_sources:
+        v_true, v_false = _get_state_preds(v, original_graph)
+        # Find best intermediate c: minimise _dist(sink,c) + _dist(c,v)
+        best_c = None
+        best_total = float("inf")
+        for c in all_nodes:
+            if c == sink_node or c == v:
+                continue
+            d1 = _dist(sink_node, c, original_graph, mutex_groups)
+            d2 = _dist(c, v, original_graph, mutex_groups)
+            total = d1 + d2
+            if total < best_total:
+                best_total = total
+                best_c = c
+        if best_c is not None:
+            c_true, c_false = _get_state_preds(best_c, original_graph)
+            paths.append({
+                "candidate_id": len(paths),
+                "source_node": v,
+                "intermediate_node": best_c,
+                "mid_true": sorted(c_true),
+                "mid_false": sorted(c_false),
+                "source_true": sorted(v_true),
+                "source_false": sorted(v_false),
+                "delta1": _dist(sink_node, best_c, original_graph, mutex_groups),
+                "delta2": _dist(best_c, v, original_graph, mutex_groups),
+                "cost_hop1": _dist(sink_node, best_c, original_graph, mutex_groups),
+                "cost_hop2": _dist(best_c, v, original_graph, mutex_groups),
+            })
+
+    if not paths:
+        return []
+
+    # Ask LLM which 2-hop path is feasible
+    prompt = build_unroll_prompt(
+        sink_true=sorted(sink_true),
+        sink_false=sorted(sink_false),
+        paths=paths,
+    )
+
+    try:
+        raw = llm_fn(prompt["user"], system=prompt["system"])
+        parsed = parse_feasibility_response(raw, len(paths))
+    except Exception as exc:
+        logger.warning(f"LLM unroll call failed: {exc}; using Hamming-best path")
+        if paths:
+            p = paths[0]
+            return [
+                (sink_node, p["intermediate_node"], p["cost_hop1"]),
+                (p["intermediate_node"], p["source_node"], p["cost_hop2"]),
+            ]
+        return []
+
+    # Pick best feasible path
+    for entry in sorted(parsed, key=lambda e: e.get("rank", 999)):
+        cid = entry["candidate_id"]
+        if not entry["is_feasible"] or cid >= len(paths):
+            continue
+        p = paths[cid]
+        return [
+            (sink_node, p["intermediate_node"], p["cost_hop1"]),
+            (p["intermediate_node"], p["source_node"], p["cost_hop2"]),
+        ]
+
+    return []
+
+
 def _best_original_bridge(
     sink_scc_id: int,
     source_scc_id: int,
     H: nx.DiGraph,
     original_graph: nx.DiGraph,
     mutex_groups: Optional[List[Any]] = None,
-) -> Tuple[Optional[str], Optional[str], float]:
+    llm_fn=None,
+    scoring_config: Optional[ScoringConfig] = None,
+) -> Tuple[Optional[str], Optional[str], float, bool]:
     """Find the (u*, v*) original-state pair with minimum distance.
 
-    Iterates over all original states in *sink_scc_id*'s meta-node
-    and all original states in *source_scc_id*'s meta-node.
-
-    Parameters
-    ----------
-    sink_scc_id, source_scc_id : int
-        Meta-node IDs in the condensation graph *H*.
-    H : nx.DiGraph
-        Condensation graph (from ``nx.condensation``).  Each node has
-        a ``'members'`` attribute (set of original node IDs).
-    original_graph : nx.DiGraph
-        The abstract transition graph (original states carry ``state``).
-    mutex_groups : list, optional
+    When *llm_fn* is provided and ``scoring_config.enable_llm_feasibility``
+    is True, candidates are validated by the LLM physics gate with
+    structural unrolling as fallback.
 
     Returns
     -------
-    (u*, v*, cost) where cost may be ``float('inf')`` if no bridge
-    is feasible.
+    (u*, v*, cost, was_unrolled) where *was_unrolled* is True when
+    the edge was produced by structural graph unrolling.
     """
     sink_members = sorted(H.nodes[sink_scc_id].get("members", set()))
     src_members = sorted(H.nodes[source_scc_id].get("members", set()))
 
+    use_llm = (
+        llm_fn is not None
+        and scoring_config is not None
+        and scoring_config.enable_llm_feasibility
+    )
+
+    if use_llm:
+        cfg = scoring_config
+        # Row-level batching: for each sink member, evaluate all source members
+        best_result: Optional[Tuple[str, str, float]] = None
+        best_cost = float("inf")
+        for u in sink_members:
+            result = evaluate_candidates(
+                u, src_members, original_graph, llm_fn,
+                mutex_groups, cfg.feasibility_k, cfg.feasibility_lambda,
+            )
+            if result is not None and result[2] < best_cost:
+                best_result = result
+                best_cost = result[2]
+
+        if best_result is not None:
+            return best_result[0], best_result[1], best_result[2], False
+
+        # Fallback: structural unrolling
+        logger.info("    LLM gate rejected all candidates; trying unrolling")
+        for u in sink_members:
+            edges = unroll_transition(
+                u, src_members, original_graph, llm_fn,
+                mutex_groups, cfg.feasibility_k,
+            )
+            if edges:
+                # First hop is the primary edge; extra hops go to buffer
+                primary = edges[0]
+                for extra in edges[1:]:
+                    _unroll_extra_edges.append(extra)
+                return primary[0], primary[1], primary[2], True
+
+    # Pure Hamming fallback (or llm disabled)
     best_u: Optional[str] = None
     best_v: Optional[str] = None
-    best_cost = float("inf")
+    best_cost_h = float("inf")
 
     for u in sink_members:
         for v in src_members:
             d = _dist(u, v, original_graph, mutex_groups)
-            if d < best_cost:
-                best_cost = d
+            if d < best_cost_h:
+                best_cost_h = d
                 best_u = u
                 best_v = v
 
-    return best_u, best_v, best_cost
+    return best_u, best_v, best_cost_h, False
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -487,7 +716,9 @@ def _build_global_cycle_across_wccs(
     wccs: List[set],
     original_graph: nx.DiGraph,
     mutex_groups: Optional[List[Any]] = None,
-) -> List[Tuple[str, str, float]]:
+    llm_fn=None,
+    scoring_config: Optional[ScoringConfig] = None,
+) -> List[Tuple[str, str, float, str]]:
     """Minimum-Weight Cycle Cover to merge all WCCs into one global cycle.
 
     1. Extract sinks/sources per WCC.
@@ -538,22 +769,23 @@ def _build_global_cycle_across_wccs(
     # ── Build k×k cost matrix + witness table ──
     INF = 1e18  # finite sentinel for the solver (real inf breaks scipy)
     C = np.full((k, k), INF, dtype=np.float64)
-    witness: Dict[Tuple[int, int], Tuple[Optional[str], Optional[str], float]] = {}
+    witness: Dict[Tuple[int, int], Tuple[Optional[str], Optional[str], float, bool]] = {}
 
     for i in range(k):
         for j in range(k):
             if i == j:
                 continue  # diagonal stays INF
             # Best bridge: sink of WCC_i → source of WCC_j
-            best_u, best_v, best_cost = None, None, float("inf")
+            best_u, best_v, best_cost, best_unrolled = None, None, float("inf"), False
             for s_scc in wcc_sinks[i]:
                 for t_scc in wcc_sources[j]:
-                    u, v, cost = _best_original_bridge(
+                    u, v, cost, unrolled = _best_original_bridge(
                         s_scc, t_scc, H, original_graph, mutex_groups,
+                        llm_fn, scoring_config,
                     )
                     if cost < best_cost:
-                        best_u, best_v, best_cost = u, v, cost
-            witness[(i, j)] = (best_u, best_v, best_cost)
+                        best_u, best_v, best_cost, best_unrolled = u, v, cost, unrolled
+            witness[(i, j)] = (best_u, best_v, best_cost, best_unrolled)
             if best_cost < float("inf"):
                 C[i, j] = best_cost
 
@@ -636,27 +868,30 @@ def _build_global_cycle_across_wccs(
     )
 
     # ── Collect witness edges for the global cycle ──
-    result: List[Tuple[str, str, float]] = []
+    result: List[Tuple[str, str, float, str]] = []
     for i in range(k):
         j = succ[i]
         w = witness.get((i, j))
         if w is None or w[0] is None or w[1] is None:
             # Need to recompute — the patching introduced new arcs
-            best_u, best_v, best_cost = None, None, float("inf")
+            best_u, best_v, best_cost, best_unrolled = None, None, float("inf"), False
             for s_scc in wcc_sinks[i]:
                 for t_scc in wcc_sources[j]:
-                    u, v, cost = _best_original_bridge(
+                    u, v, cost, unrolled = _best_original_bridge(
                         s_scc, t_scc, H, original_graph, mutex_groups,
+                        llm_fn, scoring_config,
                     )
                     if cost < best_cost:
-                        best_u, best_v, best_cost = u, v, cost
+                        best_u, best_v, best_cost, best_unrolled = u, v, cost, unrolled
             if best_u is None or best_v is None:
                 raise RuntimeError(
                     f"Cannot bridge WCC-{i} → WCC-{j}: no feasible pair"
                 )
-            result.append((best_u, best_v, best_cost))
+            phase = "mwcc+unrolled" if best_unrolled else "mwcc"
+            result.append((best_u, best_v, best_cost, phase))
         else:
-            result.append(w)
+            phase = "mwcc+unrolled" if w[3] else "mwcc"
+            result.append((w[0], w[1], w[2], phase))
 
     return result
 
@@ -669,7 +904,9 @@ def _close_one_reachable_source_sink_cycle(
     H: nx.DiGraph,
     original_graph: nx.DiGraph,
     mutex_groups: Optional[List[Any]] = None,
-) -> Tuple[str, str, float]:
+    llm_fn=None,
+    scoring_config: Optional[ScoringConfig] = None,
+) -> Tuple[str, str, float, str]:
     """Find one (sink→source) edge that closes a reachable cycle.
 
     The condensation *H* is weakly connected but has >1 SCC-node.
@@ -702,6 +939,7 @@ def _close_one_reachable_source_sink_cycle(
     best_u: Optional[str] = None
     best_v: Optional[str] = None
     best_cost = float("inf")
+    best_unrolled = False
 
     for s in sources:
         # Precompute descendants once per source
@@ -710,11 +948,12 @@ def _close_one_reachable_source_sink_cycle(
             if t not in desc:
                 continue
             # s can reach t in H → adding t→s closes a cycle
-            u, v, cost = _best_original_bridge(
+            u, v, cost, unrolled = _best_original_bridge(
                 t, s, H, original_graph, mutex_groups,
+                llm_fn, scoring_config,
             )
             if cost < best_cost:
-                best_u, best_v, best_cost = u, v, cost
+                best_u, best_v, best_cost, best_unrolled = u, v, cost, unrolled
 
     if best_u is None or best_v is None or best_cost == float("inf"):
         raise RuntimeError(
@@ -722,7 +961,8 @@ def _close_one_reachable_source_sink_cycle(
             "sink→source bridge found in the weakly-connected condensation."
         )
 
-    return best_u, best_v, best_cost
+    phase = "reachability+unrolled" if best_unrolled else "reachability"
+    return best_u, best_v, best_cost, phase
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -733,6 +973,8 @@ def _compute_augmentation_edges(
     original_graph: nx.DiGraph,
     mutex_groups: Optional[List[Any]] = None,
     max_iterations: int = 200,
+    llm_fn=None,
+    scoring_config: Optional[ScoringConfig] = None,
 ) -> Tuple[List[Tuple[str, str, float, str]], int]:
     """Monotonically add meta-edges until the graph is one SCC.
 
@@ -775,12 +1017,21 @@ def _compute_augmentation_edges(
             )
             bridges = _build_global_cycle_across_wccs(
                 H, wccs, original_graph, mutex_groups,
+                llm_fn, scoring_config,
             )
-            for u, v, cost in bridges:
+            for u, v, cost, phase in bridges:
                 E_add.append((u, v))
-                result.append((u, v, cost, "mwcc"))
+                result.append((u, v, cost, phase))
                 logger.info(
-                    f"    MWCC edge: {u} → {v} (Δ={cost:.0f})"
+                    f"    MWCC edge: {u} → {v} (Δ={cost:.0f}, {phase})"
+                )
+            # Collect any extra unrolled hops
+            while _unroll_extra_edges:
+                eu, ev, ec = _unroll_extra_edges.pop(0)
+                E_add.append((eu, ev))
+                result.append((eu, ev, ec, "unrolled"))
+                logger.info(
+                    f"    Unrolled extra hop: {eu} → {ev} (Δ={ec:.0f})"
                 )
 
         else:
@@ -789,14 +1040,23 @@ def _compute_augmentation_edges(
                 f"  Augmentation step {_step}: 1 WCC, "
                 f"{len(H.nodes())} SCCs — closing one cycle"
             )
-            u, v, cost = _close_one_reachable_source_sink_cycle(
+            u, v, cost, phase = _close_one_reachable_source_sink_cycle(
                 H, original_graph, mutex_groups,
+                llm_fn, scoring_config,
             )
             E_add.append((u, v))
-            result.append((u, v, cost, "reachability"))
+            result.append((u, v, cost, phase))
             logger.info(
-                f"    Reachability edge: {u} → {v} (Δ={cost:.0f})"
+                f"    Reachability edge: {u} → {v} (Δ={cost:.0f}, {phase})"
             )
+            # Collect any extra unrolled hops
+            while _unroll_extra_edges:
+                eu, ev, ec = _unroll_extra_edges.pop(0)
+                E_add.append((eu, ev))
+                result.append((eu, ev, ec, "unrolled"))
+                logger.info(
+                    f"    Unrolled extra hop: {eu} → {ev} (Δ={ec:.0f})"
+                )
 
     else:
         logger.warning(
@@ -816,6 +1076,7 @@ def _lift_to_operator(
     original_graph: nx.DiGraph,
     domain: Domain,
     operator_index: int,
+    phase_tag: str = "",
 ) -> SynthesizedOperator:
     """Create a SynthesizedOperator from an original-state pair.
 
@@ -854,6 +1115,7 @@ def _lift_to_operator(
     op.name = f"recover_{operator_index}"
     op.sink_node = sink_node
     op.source_node = source_node
+    op.phase_tag = phase_tag
     return op
 
 
@@ -867,6 +1129,7 @@ def delta_minimize(
     *,
     config: Optional[ScoringConfig] = None,
     mutex_groups: Optional[List[Any]] = None,
+    llm_fn=None,
 ) -> DeltaMinimizationResult:
     """
     Synthesize deterministic recovery operators to make the abstract
@@ -917,25 +1180,42 @@ def delta_minimize(
             augmented_graph=working_graph,
         )
 
+    # ── Resolve active LLM function ──
+    if config.enable_llm_feasibility:
+        if llm_fn is not None:
+            active_llm_fn = llm_fn
+        else:
+            from .llm_config import build_llm_fn
+            logger.info("  Building LLM function for feasibility gate (from llm.yaml)")
+            active_llm_fn = build_llm_fn()
+    else:
+        active_llm_fn = None
+
     # ── Compute augmentation edges ──
     max_iters = config.max_iterations
     if config.max_recovery_per_iter is not None:
         max_iters = min(max_iters, config.max_recovery_per_iter * 10)
 
+    # Clear module-level unroll buffer
+    _unroll_extra_edges.clear()
+
     aug_edges, initial_num_wccs = _compute_augmentation_edges(
         working_graph,
         mutex_groups=mutex_groups,
         max_iterations=max_iters,
+        llm_fn=active_llm_fn,
+        scoring_config=config,
     )
 
     # ── Lift each edge to a PDDL operator ──
     operators: List[SynthesizedOperator] = []
     phase1_count = 0  # MWCC edges count as "Phase 1" for visualization
     phase2_count = 0  # Reachability edges count as "Phase 2"
+    phase3_count = 0  # Unrolled edges count as "Phase 3"
     deltas: List[int] = []
 
     for idx, (u, v, cost, phase) in enumerate(aug_edges):
-        op = _lift_to_operator(u, v, working_graph, domain, idx)
+        op = _lift_to_operator(u, v, working_graph, domain, idx, phase_tag=phase)
         action_schema = _convert_to_action_schema(op)
         domain.actions.append(action_schema)
 
@@ -945,8 +1225,10 @@ def delta_minimize(
         operators.append(op)
         deltas.append(op.delta)
 
-        if phase == "mwcc":
+        if "mwcc" in phase:
             phase1_count += 1
+        elif "unrolled" == phase:
+            phase3_count += 1
         else:
             phase2_count += 1
 
@@ -969,12 +1251,14 @@ def delta_minimize(
         "iterations": len(operators),
         "phase1_ops": phase1_count,
         "phase2_ops": phase2_count,
+        "phase3_ops": phase3_count,
         "num_wccs": initial_num_wccs,
     }
 
     logger.info(
         f"Delta minimization complete: {len(operators)} operators "
-        f"(MWCC: {phase1_count}, Reachability: {phase2_count}), "
+        f"(MWCC: {phase1_count}, Reachability: {phase2_count}, "
+        f"Unrolled: {phase3_count}), "
         f"avg delta={avg_delta:.1f}, irreducible={is_irr}"
     )
 

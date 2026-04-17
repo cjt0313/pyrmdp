@@ -7,6 +7,7 @@ Each file in this package handles ONE LLM query purpose:
   • ``llm_operator_prompt``  — Step 0b: task NL → operators
   • ``llm_failure_prompt``   — Step 1:  failure hallucination
   • ``llm_recovery_prompt``  — Step 5:  recovery operator synthesis
+  • ``llm_feasibility_prompt``— Step 5b: physical feasibility gate
   • ``llm_mutex_prompt``     — R5:      mutex constraint generation
   • ``response_parser``      — Shared JSON extraction utility
 

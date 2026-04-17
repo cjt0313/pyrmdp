@@ -14,11 +14,14 @@ inlining their own OpenAI client setup.
 
 from __future__ import annotations
 
+import inspect
+import json
 import logging
 import os
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +152,112 @@ def load_config(path: Optional[str] = None) -> LLMConfig:
 
 
 # ════════════════════════════════════════════════════════════════════
+#  LLM Usage Tracker
+# ════════════════════════════════════════════════════════════════════
+
+@dataclass
+class _ModuleStats:
+    """Accumulator for one calling module."""
+    calls: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+
+class LLMUsageTracker:
+    """Thread-safe tracker for per-module LLM call counts and token usage.
+
+    Attached to every callable returned by :func:`build_llm_fn` as the
+    ``.tracker`` attribute.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._modules: Dict[str, _ModuleStats] = {}
+        self._queries: List[Dict[str, Any]] = []
+
+    # ── Recording ──
+
+    def record(
+        self,
+        module: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+        *,
+        prompt_preview: str = "",
+        response_preview: str = "",
+    ) -> None:
+        with self._lock:
+            if module not in self._modules:
+                self._modules[module] = _ModuleStats()
+            s = self._modules[module]
+            s.calls += 1
+            s.prompt_tokens += prompt_tokens
+            s.completion_tokens += completion_tokens
+            s.total_tokens += total_tokens
+            self._queries.append({
+                "module": module,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+                "prompt_preview": prompt_preview[:200],
+                "response_preview": response_preview[:200],
+            })
+
+    # ── Reporting ──
+
+    def report(self) -> Dict[str, Any]:
+        """Return a JSON-serialisable report."""
+        with self._lock:
+            per_module = {}
+            for mod, s in sorted(self._modules.items()):
+                per_module[mod] = {
+                    "calls": s.calls,
+                    "prompt_tokens": s.prompt_tokens,
+                    "completion_tokens": s.completion_tokens,
+                    "total_tokens": s.total_tokens,
+                }
+            total_calls = sum(s.calls for s in self._modules.values())
+            total_prompt = sum(s.prompt_tokens for s in self._modules.values())
+            total_comp = sum(s.completion_tokens for s in self._modules.values())
+            total_tok = sum(s.total_tokens for s in self._modules.values())
+            return {
+                "total": {
+                    "calls": total_calls,
+                    "prompt_tokens": total_prompt,
+                    "completion_tokens": total_comp,
+                    "total_tokens": total_tok,
+                },
+                "per_module": per_module,
+                "queries": list(self._queries),
+            }
+
+    def save(self, path: Path) -> None:
+        """Write the usage report as JSON."""
+        path.write_text(
+            json.dumps(self.report(), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        logger.info(f"  ✓ Saved LLM usage report: {path}")
+
+
+# Global tracker — shared across all llm_fn instances in a single process
+_global_tracker = LLMUsageTracker()
+
+
+def get_global_tracker() -> LLMUsageTracker:
+    """Return the process-global :class:`LLMUsageTracker`."""
+    return _global_tracker
+
+
+def reset_global_tracker() -> None:
+    """Reset the global tracker (useful for test isolation)."""
+    global _global_tracker
+    _global_tracker = LLMUsageTracker()
+
+
+# ════════════════════════════════════════════════════════════════════
 #  LLM function builder
 # ════════════════════════════════════════════════════════════════════
 
@@ -188,6 +297,7 @@ def build_llm_fn(config: Optional[LLMConfig] = None) -> Callable[[str], str]:
         client_kwargs["max_retries"] = config.max_retries
 
     client = OpenAI(**client_kwargs)
+    tracker = _global_tracker
 
     def _call(prompt: str, *, system: str | None = None) -> str:
         """Send a chat completion request.
@@ -213,6 +323,30 @@ def build_llm_fn(config: Optional[LLMConfig] = None) -> Callable[[str], str]:
             max_tokens=config.max_tokens,
             top_p=config.top_p,
         )
-        return resp.choices[0].message.content
 
+        # ── Track usage ──
+        text = resp.choices[0].message.content
+        usage = resp.usage
+        pt = usage.prompt_tokens if usage else 0
+        ct = usage.completion_tokens if usage else 0
+        tt = usage.total_tokens if usage else 0
+
+        # Detect caller module
+        frame = inspect.currentframe()
+        caller = "unknown"
+        if frame and frame.f_back:
+            caller_file = frame.f_back.f_globals.get("__name__", "unknown")
+            # Simplify: take last 2 dotted segments
+            parts = caller_file.rsplit(".", 2)
+            caller = ".".join(parts[-2:]) if len(parts) >= 2 else caller_file
+
+        tracker.record(
+            caller, pt, ct, tt,
+            prompt_preview=prompt[:200],
+            response_preview=(text or "")[:200],
+        )
+
+        return text
+
+    _call.tracker = tracker  # type: ignore[attr-defined]
     return _call

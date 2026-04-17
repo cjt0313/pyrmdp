@@ -48,6 +48,8 @@ import numpy as np
 from scipy.linalg import eigvals
 from scipy.stats import wasserstein_distance as _wasserstein_1d
 
+from .llm_config import get_global_tracker, reset_global_tracker
+
 # Internal pipeline modules
 from .llm_failure import hallucinate_failures, FailureHallucinationResult
 from .fodd_builder import (
@@ -191,6 +193,83 @@ def spectral_distance_wasserstein(
     into the other and is robust to dimension growth.
     """
     return float(_wasserstein_1d(current, previous))
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Operator NL Translation
+# ════════════════════════════════════════════════════════════════════
+
+_NL_SYSTEM = (
+    "You are a concise robotics-domain translator. "
+    "Given a PDDL recovery operator's preconditions and effects, "
+    "produce ONE short English sentence (max 20 words) that describes "
+    "what the robot does. Be precise and clear. "
+    "Reply with ONLY the sentence, no quotes, no explanation."
+)
+
+
+def _translate_operators_to_nl(
+    operators: list,
+    llm_fn,
+) -> Dict[str, str]:
+    """Batch-translate operators to natural language.
+
+    Parameters
+    ----------
+    operators : list[dict]
+        Serialised operator dicts with keys ``name``, ``precondition_atoms``,
+        ``nominal_add``, ``nominal_del``, ``parameters``.
+    llm_fn : callable
+        ``fn(prompt, *, system=...) → str``
+
+    Returns
+    -------
+    dict mapping operator name → NL sentence
+    """
+    results: Dict[str, str] = {}
+    if not operators or llm_fn is None:
+        return results
+
+    # Build one batch prompt for all operators
+    lines = []
+    for i, op in enumerate(operators):
+        preconds = op.get("precondition_atoms", [])
+        adds = op.get("nominal_add", [])
+        dels = op.get("nominal_del", [])
+        params = op.get("parameters", [])
+        param_str = ", ".join(f"{p['name']}: {p['type']}" for p in params)
+        pre_str = ", ".join(str(a) for a in preconds) or "(none)"
+        add_str = ", ".join(str(a) for a in adds) or "(none)"
+        del_str = ", ".join(str(a) for a in dels) or "(none)"
+        phase_tag = op.get("phase_tag", "")
+        lines.append(
+            f"[{i}] {op['name']} (params: {param_str})\n"
+            f"  Source: {phase_tag or 'hamming'}\n"
+            f"  Preconditions: {pre_str}\n"
+            f"  Add effects: {add_str}\n"
+            f"  Del effects: {del_str}"
+        )
+
+    prompt = (
+        "Translate each operator below into ONE short English sentence.\n"
+        "Format: one line per operator, starting with the index number.\n"
+        "Example: [0] Pick up the cup from the table.\n\n"
+        + "\n\n".join(lines)
+    )
+
+    try:
+        raw = llm_fn(prompt, system=_NL_SYSTEM)
+        # Parse: each line starts with [i]
+        import re
+        for m in re.finditer(r'\[(\d+)\]\s*(.+)', raw):
+            idx = int(m.group(1))
+            sentence = m.group(2).strip().rstrip(".")  + "."
+            if idx < len(operators):
+                results[operators[idx]["name"]] = sentence
+    except Exception as exc:
+        logger.warning(f"NL operator translation failed: {exc}")
+
+    return results
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -384,6 +463,7 @@ class IterativeDomainSynthesizer:
         """
         # ── Clean stale iter* artefacts from previous runs ──
         out = self._ensure_dir()
+        reset_global_tracker()  # Fresh usage tracking for this run
         for stale in out.glob("iter*"):
             stale.unlink(missing_ok=True)
         for stale in out.glob("robustified.ppddl"):
@@ -703,6 +783,7 @@ class IterativeDomainSynthesizer:
                 self.domain,
                 config=self.scoring_config,
                 mutex_groups=self._mutex_groups or None,
+                llm_fn=self.llm_fn,
             )
             self.delta_result = delta_result
             timings[f"iter{iteration}_step5"] = time.time() - t0
@@ -715,26 +796,41 @@ class IterativeDomainSynthesizer:
                 f"Irreducible: {delta_result.is_irreducible}"
             )
 
+            op_dicts = [
+                {
+                    "name": op.name,
+                    "sink_scc": op.sink_scc,
+                    "source_scc": op.source_scc,
+                    "sink_node": op.sink_node,
+                    "source_node": op.source_node,
+                    "phase_tag": op.phase_tag,
+                    "delta": op.delta,
+                    "parameters": [
+                        {"name": p.name, "type": p.type}
+                        for p in op.parameters
+                    ],
+                    "precondition_atoms": [list(t) for t in op.precondition_atoms],
+                    "nominal_add": [list(t) for t in op.nominal_add],
+                    "nominal_del": [list(t) for t in op.nominal_del],
+                }
+                for op in delta_result.operators
+            ]
+
+            # ── Step 5b: Translate operators to natural language ──
+            query_fn = self.llm_fn
+            if query_fn is None:
+                try:
+                    from .llm_config import build_llm_fn
+                    query_fn = build_llm_fn()
+                except Exception:
+                    query_fn = None
+            nl_map = _translate_operators_to_nl(op_dicts, query_fn)
+            for od in op_dicts:
+                od["nl_description"] = nl_map.get(od["name"], "")
+
             self._save_json(
                 f"iter{iteration}_step5_synthesized_operators.json",
-                [
-                    {
-                        "name": op.name,
-                        "sink_scc": op.sink_scc,
-                        "source_scc": op.source_scc,
-                        "sink_node": op.sink_node,
-                        "source_node": op.source_node,
-                        "delta": op.delta,
-                        "parameters": [
-                            {"name": p.name, "type": p.type}
-                            for p in op.parameters
-                        ],
-                        "precondition_atoms": [list(t) for t in op.precondition_atoms],
-                        "nominal_add": [list(t) for t in op.nominal_add],
-                        "nominal_del": [list(t) for t in op.nominal_del],
-                    }
-                    for op in delta_result.operators
-                ],
+                op_dicts,
             )
             self._save_json(
                 f"iter{iteration}_step5_stats.json", delta_result.stats,
@@ -805,6 +901,10 @@ class IterativeDomainSynthesizer:
         summary_data["timings"] = timings
         summary_data["output_path"] = output_path
         self._save_json("pipeline_summary.json", summary_data)
+
+        # ── Save LLM usage report ──
+        tracker = get_global_tracker()
+        tracker.save(out / "llm_usage.json")
 
         return self.ppddl_output
 

@@ -74,6 +74,16 @@ class PipelineConfig:
     delta_threshold: int = 15
     """Max predicate delta the LLM can handle in one synthesis prompt."""
 
+    enable_llm_feasibility: bool = True
+    """Enable LLM physics-feasibility gate for Step 5 bridge selection.
+    When False (default), Step 5 uses pure Hamming MSCA/MWCC."""
+
+    feasibility_k: int = 5
+    """Number of top-k Hamming candidates to evaluate via the LLM gate."""
+
+    feasibility_lambda: float = 0.5
+    """Blending weight for LLM rank penalty in the calibrated cost function."""
+
     # ── Step 6: Multi-Policy Emission ────────────────────────────
     num_robot_policies: int = 3
     """K robot-policy variants per action."""
@@ -124,6 +134,9 @@ class PipelineConfig:
             max_candidates_per_iter=self.max_candidates_per_iter,
             delta_threshold=self.delta_threshold,
             max_recovery_per_iter=self.max_recovery_per_iter,
+            enable_llm_feasibility=self.enable_llm_feasibility,
+            feasibility_k=self.feasibility_k,
+            feasibility_lambda=self.feasibility_lambda,
         )
 
     def emission_config(self):
@@ -180,6 +193,8 @@ class PipelineConfig:
                 "scoring_alpha", "scoring_beta", "max_delta_iterations",
                 "max_recovery_per_iter", "max_candidates_per_iter",
                 "delta_threshold",
+                "enable_llm_feasibility", "feasibility_k",
+                "feasibility_lambda",
             ],
             "# ── Step 6: Multi-Policy Emission": [
                 "num_robot_policies",

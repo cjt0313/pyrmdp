@@ -111,6 +111,12 @@ def load_pipeline_data(output_dir: Path) -> dict:
         with open(origins_path) as f:
             data["origins"] = json.load(f)
 
+    # LLM usage report
+    usage_path = output_dir / "llm_usage.json"
+    if usage_path.exists():
+        with open(usage_path) as f:
+            data["llm_usage"] = json.load(f)
+
     # Merge Step 1 hallucinated predicates/types from failures (fallback)
     # Also build per-iteration hallucination audit for the visualization.
     origins = data.get("origins", {"types": {}, "predicates": {}})
@@ -654,13 +660,18 @@ def generate_html(data: dict) -> str:
         if len(false_preds) > 2:
             parts.append(f"+{len(false_preds)-2}")
         short = ", ".join(parts)
+        # Full state tooltip — every predicate listed
+        true_items = "".join(f"<br>&nbsp;&nbsp;✓ {p}" for p in true_preds)
+        false_items = "".join(f"<br>&nbsp;&nbsp;✗ {p}" for p in false_preds)
         tooltip_lines = [
             f"<b>{node_id}</b>",
-            f"SCC: {scc_id}  (iter {iteration})",
-            f"<br><b>True:</b> {', '.join(true_preds)}",
+            f"SCC: {scc_id} &nbsp;|&nbsp; iter {iteration}",
+            f"<br><b>True predicates ({len(true_preds)}):</b>{true_items}",
         ]
         if false_preds:
-            tooltip_lines.append(f"<b>False:</b> {', '.join(false_preds)}")
+            tooltip_lines.append(
+                f"<br><b>False predicates ({len(false_preds)}):</b>{false_items}"
+            )
         return {
             "id": node_id,
             "label": short or node_id[:8],
@@ -673,6 +684,7 @@ def generate_html(data: dict) -> str:
     all_phases = []
     seen_node_ids: set = set()
     seen_edge_keys: set = set()     # (from, to, action) tuples
+    _nl_lookup: dict = {}           # cumulative recover_X -> NL description
 
     for it_data in iterations_data:
         it = it_data["iteration"]
@@ -690,16 +702,26 @@ def generate_html(data: dict) -> str:
                 new_nodes.append(_build_node(node_id, it_states, it_scc_map, it))
                 seen_node_ids.add(node_id)
 
+        # Accumulate recover_X name -> NL description across iterations
+        for op in it_ops:
+            oname = op.get("name", "")
+            nl = op.get("nl_description", "")
+            if nl:
+                _nl_lookup[oname] = nl
+
         # New original edges
         new_orig_edges = []
         for u, v, d in it_graph.edges(data=True):
             action = d.get("action", "?")
             ekey = (u, v, action)
             if ekey not in seen_edge_keys:
+                nl = _nl_lookup.get(action, "")
+                label = f"{nl[:50]}\u2026\n({action})" if nl and len(nl) > 50 else f"{nl}\n({action})" if nl else action
+                title = f"Action: {action}" + (f"<br><i>\U0001f4ac {nl}</i>" if nl else "")
                 new_orig_edges.append({
                     "from": u, "to": v,
-                    "label": action,
-                    "title": f"Action: {action}",
+                    "label": label,
+                    "title": title,
                     "action": action,
                 })
                 seen_edge_keys.add(ekey)
@@ -726,22 +748,63 @@ def generate_html(data: dict) -> str:
             dels = _fmt_atoms(op.get('nominal_del', []))
             preconds = _fmt_atoms(op.get('precondition_atoms', []))
             params = _fmt_params(op.get('parameters', []))
+            nl_desc = op.get('nl_description', '')
 
-            edge_phase = 1 if i < phase1_count else 2
-            phase_label = "MWCC" if edge_phase == 1 else "Reachability"
+            # Determine edge phase from phase_tag or fallback to index-based
+            phase_tag = op.get("phase_tag", "")
+            if "unrolled" in phase_tag:
+                edge_phase = 3
+                phase_label = "Unrolled (2-hop)"
+                source_badge = "🔀 Unrolled"
+            elif i < phase1_count:
+                edge_phase = 1
+                phase_label = "MWCC"
+                source_badge = "⛓ MWCC"
+            else:
+                edge_phase = 2
+                phase_label = "Reachability"
+                source_badge = "⚡ Reachability"
+
+            # Edge label: NL sentence is primary, op name is secondary
+            if nl_desc:
+                short_nl = nl_desc if len(nl_desc) <= 50 else nl_desc[:47] + "…"
+                edge_label = f"{short_nl}\n({op['name']})"
+            else:
+                edge_label = op["name"]
+
+            # Full tooltip with all details
+            pre_lines = "".join(
+                f"<br>&nbsp;&nbsp;• {p}" for p in preconds
+            ) if preconds else "<br>&nbsp;&nbsp;(none)"
+            add_lines = "".join(
+                f"<br>&nbsp;&nbsp;+ {a}" for a in adds
+            ) if adds else "<br>&nbsp;&nbsp;(none)"
+            del_lines = "".join(
+                f"<br>&nbsp;&nbsp;− {d}" for d in dels
+            ) if dels else "<br>&nbsp;&nbsp;(none)"
+
+            tooltip = (
+                f"<b>{source_badge} — {op['name']}</b><br>"
+                f"Phase {edge_phase}: {phase_label} &nbsp;|&nbsp; Δ={op['delta']}<br>"
+                f"{from_node} → {to_node}<br>"
+            )
+            if nl_desc:
+                tooltip += f"<br><i>💬 {nl_desc}</i><br>"
+            tooltip += (
+                f"<br><b>Parameters:</b> ({params})"
+                f"<br><b>Preconditions:</b>{pre_lines}"
+                f"<br><b>Add effects:</b>{add_lines}"
+                f"<br><b>Del effects:</b>{del_lines}"
+            )
+
             it_recovery.append({
                 "from": from_node, "to": to_node,
-                "label": op["name"],
-                "title": (
-                    f"<b>Recovery (iter {it}, Phase {edge_phase} — {phase_label}):</b> {op['name']}<br>"
-                    f"Δ={op['delta']} | {from_node} → {to_node}<br>"
-                    f"Params: ({params})<br>"
-                    f"Pre: {', '.join(preconds) if preconds else '(none)'}<br>"
-                    f"Add: {', '.join(adds) if adds else '(none)'}<br>"
-                    f"Del: {', '.join(dels) if dels else '(none)'}"
-                ),
+                "label": edge_label,
+                "title": tooltip,
                 "delta": op["delta"],
                 "phase": edge_phase,
+                "phase_tag": phase_tag,
+                "nl_description": nl_desc,
                 "iteration": it,
                 "sink_scc": op.get("sink_scc", -1),
                 "source_scc": op.get("source_scc", -1),
@@ -843,26 +906,24 @@ def generate_html(data: dict) -> str:
             still_isolated = new_node_ids - all_connected
             if still_isolated:
                 # Build predicate-set map for old nodes
+                def _extract_preds(title: str) -> frozenset:
+                    """Extract true predicate names from node tooltip HTML."""
+                    preds = set()
+                    for pm in _re.finditer(r"\u2713 ([^<]+)", title):
+                        preds.add(pm.group(1).strip())
+                    return frozenset(preds)
+
                 old_node_preds: dict = {}
                 for prev_phase in all_phases[:pi]:
                     for n in prev_phase["newNodes"]:
-                        # Parse true predicates from the title
-                        title = n.get("title", "")
-                        m = _re.search(r"<b>True:</b>\s*(.+?)(?:<br>|$)", title)
-                        if m:
-                            preds = frozenset(p.strip() for p in m.group(1).split(","))
-                        else:
-                            preds = frozenset()
-                        old_node_preds[n["id"]] = preds
+                        old_node_preds[n["id"]] = _extract_preds(n.get("title", ""))
 
                 # Build predicate-set map for isolated new nodes
                 for iso_id in still_isolated:
                     iso_node = next((n for n in phase["newNodes"] if n["id"] == iso_id), None)
                     if not iso_node:
                         continue
-                    title = iso_node.get("title", "")
-                    m = _re.search(r"<b>True:</b>\s*(.+?)(?:<br>|$)", title)
-                    iso_preds = frozenset(p.strip() for p in m.group(1).split(",")) if m else frozenset()
+                    iso_preds = _extract_preds(iso_node.get("title", ""))
 
                     # Find best match by Jaccard similarity
                     best_id, best_sim = None, -1.0
@@ -881,8 +942,8 @@ def generate_html(data: dict) -> str:
                         provenance.append({
                             "from": best_id,
                             "to": iso_id,
-                            "label": f"≈ nearest",
-                            "title": (f"Provenance: nearest match (Jaccard={best_sim:.2f})<br>"
+                            "label": "",
+                            "title": (f"Provenance: nearest match from previous iteration (Jaccard={best_sim:.2f})<br>"
                                       f"Isolated state discovered in iter {phase['iteration']}"),
                             "originAction": "__isolated__",
                         })
@@ -968,6 +1029,14 @@ def generate_html(data: dict) -> str:
     # Operators panel — raw PPDDL display
     operators_html_parts = []
     recovery_names = {r["name"] for r in operators}
+    # Build NL description lookup from all iterations' synthesized operators
+    _op_nl_map: dict = {}
+    for it_d in iterations_data:
+        for op_d in it_d.get("operators", []):
+            nl = op_d.get("nl_description", "")
+            if nl:
+                _op_nl_map[op_d["name"]] = nl
+
     for i, op in enumerate(operators_list):
       # Origin badge
       origin = "recovery" if op["name"] in recovery_names else "original"
@@ -979,6 +1048,13 @@ def generate_html(data: dict) -> str:
 
       raw = html_mod.escape(op.get("raw_ppddl", f"(:action {op['name']} …)"))
 
+      # NL description line for recovery operators
+      nl_desc = _op_nl_map.get(op["name"], "")
+      nl_html = ""
+      if nl_desc:
+        nl_escaped = html_mod.escape(nl_desc)
+        nl_html = f'<div class="op-nl-desc">💬 {nl_escaped}</div>'
+
       # Failure explanation
       fail_expl = failure_map.get(op["name"], "")
       fail_html = ""
@@ -986,12 +1062,15 @@ def generate_html(data: dict) -> str:
         fail_expl_escaped = html_mod.escape(fail_expl)
         fail_html = f'<div class="op-failure">⚠ {fail_expl_escaped}</div>'
 
+      # Use NL description as display name for recovery operators
+      display_name = nl_desc if nl_desc else op["name"]
       operators_html_parts.append(
         f'<div class="op-card">'
         f'<div class="op-header">'
-        f'<span class="op-name-card">{op["name"]}</span>'
+        f'<span class="op-name-card">{html_mod.escape(display_name)}</span>'
         f'{origin_badge}'
         f'</div>'
+        f'<div style="color:#8b949e;font-size:11px;padding:2px 10px;">{op["name"]}</div>'
         f'<pre class="ppddl-block">{raw}</pre>'
         f'{fail_html}'
         f'</div>'
@@ -1327,6 +1406,11 @@ def generate_html(data: dict) -> str:
     color: #f0883e;
     border: 1px solid rgba(240,136,62,0.3);
   }}
+  .event .phase-badge.p3 {{
+    background: rgba(232,168,56,0.15);
+    color: #e8a838;
+    border: 1px solid rgba(232,168,56,0.3);
+  }}
   .event-section-header {{
     padding: 6px 10px;
     font-size: 11px;
@@ -1338,6 +1422,7 @@ def generate_html(data: dict) -> str:
   }}
   .event-section-header.phase1 {{ color: #38cbcf; }}
   .event-section-header.phase2 {{ color: #f0883e; }}
+  .event-section-header.phase3 {{ color: #e8a838; }}
 
   /* SCC meter */
   .scc-meter {{
@@ -2022,6 +2107,7 @@ function addOrigEdge(e) {{
   const id = `e_${{edgeId++}}`;
   edges.add({{
     id, from: e.from, to: e.to, label: e.label, title: e.title,
+    font: {{ multi: true, size: 11, color: '#8b949e' }},
     color: {{ color: '#58a6ff', highlight: '#79c0ff', opacity: 0.85 }},
     width: 2, dashes: false,
   }});
@@ -2030,12 +2116,20 @@ function addOrigEdge(e) {{
 function addRecEdge(re) {{
   const id = `r_${{edgeId++}}`;
   const isP1 = re.phase === 1;
-  const c = isP1 ? '#38cbcf' : recColor(re.delta);
+  const isP3 = re.phase === 3;
+  const c = isP3 ? '#e8a838' : isP1 ? '#38cbcf' : recColor(re.delta);
+  // Source badge prefix for the label
+  const badge = isP3 ? '🔀 ' : isP1 ? '⛓ ' : '⚡ ';
+  const lbl = badge + re.label;
   edges.add({{
-    id, from: re.from, to: re.to, label: re.label, title: re.title,
+    id, from: re.from, to: re.to,
+    label: lbl,
+    title: re.title,
     color: {{ color: c, highlight: '#fff', opacity: 0.9 }},
-    width: isP1 ? 3.0 : 2.5,
-    dashes: isP1 ? [8, 4] : false,
+    font: {{ size: 11, color: '#e6edf3', strokeWidth: 2, strokeColor: '#0d1117',
+             multi: true, align: 'middle' }},
+    width: isP3 ? 2.5 : isP1 ? 3.0 : 2.5,
+    dashes: isP3 ? [4, 4] : isP1 ? [8, 4] : false,
   }});
 }}
 
@@ -2119,7 +2213,7 @@ function updateUI(step) {{
   }} else if (entry.type === 'recovery') {{
     const re = phases[entry.phaseIdx].recoveryEdges[entry.recIdx];
     const it = phases[entry.phaseIdx].iteration;
-    const pLabel = re.phase === 1 ? 'Phase 1 (MWCC)' : 'Phase 2 (Reachability)';
+    const pLabel = re.phase === 1 ? 'Phase 1 (MWCC)' : re.phase === 3 ? 'Phase 3 (Unrolled)' : 'Phase 2 (Reachability)';
     labelEl.textContent = `Iter ${{it}} ${{pLabel}}: ${{re.label}} (Δ=${{re.delta}})`;
   }} else {{
     labelEl.textContent = '✓ Converged — graph is irreducible';
@@ -2152,9 +2246,11 @@ timeline.forEach((entry, idx) => {{
     const tag = `iter${{ph.iteration}}_p${{re.phase}}`;
     if (tag !== lastPhaseTag) {{
       const hdr = document.createElement('div');
-      hdr.className = 'event-section-header ' + (re.phase === 1 ? 'phase1' : 'phase2');
+      hdr.className = 'event-section-header ' + (re.phase === 1 ? 'phase1' : re.phase === 3 ? 'phase3' : 'phase2');
       if (re.phase === 1) {{
         hdr.textContent = `⛓ Phase 1: MWCC (${{ph.numWCCs}} WCCs)`;
+      }} else if (re.phase === 3) {{
+        hdr.textContent = `🔀 Phase 3: Unrolled (2-hop)`;
       }} else {{
         hdr.textContent = `⚡ Phase 2: Reachability Closure`;
       }}
@@ -2179,13 +2275,20 @@ timeline.forEach((entry, idx) => {{
     lastPhaseTag = '';  // reset on new graph phase
   }} else if (entry.type === 'recovery') {{
     const re = phases[entry.phaseIdx].recoveryEdges[entry.recIdx];
-    const pClass = re.phase === 1 ? 'p1' : 'p2';
-    const pText  = re.phase === 1 ? 'P1' : 'P2';
+    const pClass = re.phase === 1 ? 'p1' : re.phase === 3 ? 'p3' : 'p2';
+    const pText  = re.phase === 1 ? 'P1' : re.phase === 3 ? 'P3' : 'P2';
+    // Extract the operator name from the label (inside parentheses at the end)
+    const nameMatch = re.label.match(/\(([^)]+)\)\s*$/);
+    const opName = nameMatch ? nameMatch[1] : re.label.split('\\n')[0];
+    // Use NL description if available, otherwise fall back to operator name
+    const nlDesc = re.nl_description || '';
+    const displayName = nlDesc ? nlDesc : opName;
+    const shortDisplay = displayName.length > 55 ? displayName.slice(0, 52) + '…' : displayName;
     ev.innerHTML = `<span class="step-num">${{idx}}</span> `
-      + `<span class="op-name">${{re.label}}</span>`
+      + `<span class="op-name">${{shortDisplay}}</span>`
       + `<span class="delta-badge">Δ=${{re.delta}}</span>`
       + `<span class="phase-badge ${{pClass}}">${{pText}}</span>`
-      + `<br><span style="color:#8b949e;font-size:11px;">SCC-${{re.sink_scc}} → SCC-${{re.source_scc}}</span>`;
+      + `<br><span style="color:#8b949e;font-size:11px;">${{opName}} &nbsp;|&nbsp; ${{re.from}} → ${{re.to}}</span>`;
   }} else {{
     ev.innerHTML = `<span class="step-num">✓</span> <b style="color:#238636;">Converged</b> — irreducible`;
   }}
