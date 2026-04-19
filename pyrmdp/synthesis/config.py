@@ -76,7 +76,8 @@ class PipelineConfig:
 
     enable_llm_feasibility: bool = True
     """Enable LLM physics-feasibility gate for Step 5 bridge selection.
-    When False (default), Step 5 uses pure Hamming MSCA/MWCC."""
+    When True (default), top-k Hamming candidates are ranked by an LLM
+    plausibility check.  When False, Step 5 uses pure Hamming MSCA/MWCC."""
 
     feasibility_k: int = 5
     """Number of top-k Hamming candidates to evaluate via the LLM gate."""

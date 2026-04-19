@@ -86,7 +86,7 @@ RGB + Task NL ──► Step 0 ──►  ┌─ Step 1 ──► Step 2 ──�
                                      Multi-Policy Emission
 ```
 
-The pipeline has **4 LLM-based tasks**, each with an independent prompt file.
+The pipeline has **4 required LLM-based tasks** plus an **optional feasibility gate**, each with an independent prompt file.
 Step 5 (recovery synthesis) is **fully deterministic** — no LLM call required.
 
 | LLM Task | Prompt File | Step |
@@ -95,6 +95,7 @@ Step 5 (recovery synthesis) is **fully deterministic** — no LLM call required.
 | Task NL → Operators (LLM) | `prompts/llm_operator_prompt.py` | 0b |
 | Action → Failure Mode (LLM) | `prompts/llm_failure_prompt.py` | 1 |
 | Predicates → Mutex Constraints (LLM) | `prompts/llm_mutex_prompt.py` | R5 |
+| Bridge Feasibility Gate (LLM, optional) | `prompts/llm_feasibility_prompt.py` | 5 |
 
 > **Note:** Step 5 previously used `prompts/llm_recovery_prompt.py` to query the
 > LLM for recovery operators. This was replaced with deterministic synthesis
@@ -260,12 +261,12 @@ Identify structural deficiencies in the condensation DAG.
 
 **Module:** `synthesis/delta_minimizer.py`
 
-Synthesize recovery operators to make the abstract graph strongly connected (irreducible). Recovery operators are computed **deterministically** from the predicate delta — no LLM call required. The algorithm uses a **monotonic cycle-closing loop** with **Minimum Weight Cycle Cover (MWCC)** for inter-component routing and **reachability-based cycle closure** for intra-component merging.
+Synthesize recovery operators to make the abstract graph strongly connected (irreducible). Recovery operators are computed **deterministically** from the predicate delta. The algorithm uses a **monotonic cycle-closing loop** with **Minimum Weight Cycle Cover (MWCC)** for inter-component routing and **reachability-based cycle closure** for intra-component merging. An optional **LLM feasibility gate** filters physically implausible bridges and triggers **structural unrolling** when no 1-step bridge is feasible.
 
 | | |
 |---|---|
 | **Input** | Abstract graph, `Domain` |
-| **LLM Task** | *None* — fully deterministic |
+| **LLM Task** | *Optional* — Feasibility Gate & Unrolling (when `enable_llm_feasibility=True`) |
 | **Output** | `DeltaMinimizationResult` — synthesized operators + updated graph |
 
 #### Algorithm 1 — Main Augmentation Loop (`_compute_augmentation_edges`)
@@ -320,6 +321,17 @@ For each `(sink_state, source_state)` pair returned by the augmentation loop:
 **Why reachability closure?** By only adding edges where the source already reaches the sink in the DAG, each added edge is guaranteed to close a directed cycle and merge ≥ 2 SCCs into 1 — no wasted edges.
 
 **Why deterministic?** The precondition and effect are fully determined by the abstract state pair — there is nothing for the LLM to invent. Step 5 runs **instantly** (no HTTP requests), making the overall pipeline significantly faster.
+
+#### LLM Feasibility Gate & Structural Unrolling (Optional)
+
+When `enable_llm_feasibility=True`, the Hamming-distance proposals are filtered by an LLM acting as a **hard physical gate and ranker** (`evaluate_candidates()`):
+
+1. Select the top-*k* Hamming candidates for each sink → source bridge (configurable via `feasibility_k`, default 5)
+2. Send the batch to the LLM (`prompts/llm_feasibility_prompt.py`) for physics plausibility ranking
+3. Compute a **calibrated cost**: `C' = d_ham + λ · (rank − 1) / k`, where `λ` is `feasibility_lambda` (default 0.5)
+4. If the LLM call fails, fall back silently to pure Hamming distance
+
+**Structural Graph Unrolling** (`unroll_transition()`): If *all* 1-step bridges for a given sink are physically impossible, the system triggers **2-hop unrolling** — it searches for an intermediate abstract state *c* that minimises `dist(sink, c) + dist(c, source)`, then asks the LLM to validate the 2-hop sequence. This routes recovery through a physically reachable intermediate rather than forcing an impossible single-step jump. Unrolled operators are tagged `"mwcc+unrolled"` or `"reachability+unrolled"` for provenance tracking.
 
 ---
 
@@ -436,6 +448,7 @@ pyrmdp/
 │   │   │   ├── llm_operator_prompt.py   # Step 0b — task NL → operators
 │   │   │   ├── llm_failure_prompt.py    # Step 1  — failure hallucination
 │   │   │   ├── llm_recovery_prompt.py   # (legacy — Step 5 is now deterministic)
+│   │   │   ├── llm_feasibility_prompt.py# Optional physics-feasibility gate (Step 5)
 │   │   │   └── llm_mutex_prompt.py      # R5      — mutex constraint generation
 │   │   ├── domain_genesis.py            # Step 0 — orchestrates 0a + 0b → PDDL domain
 │   │   ├── llm_failure.py               # Step 1 — LLM failure hallucination logic
@@ -454,7 +467,8 @@ pyrmdp/
 │   ├── plot_convergence.py              # Publication-quality convergence plots
 │   ├── plot_metrics_comparison.py       # 3-metric (cosine/L2/Wasserstein) comparison plot
 │   ├── generate_add.py                  # Build & visualize an FODD from PPDDL
-│   └── generate_markov.py              # Build & visualize abstract Markov chain
+│   ├── generate_markov.py              # Build & visualize abstract Markov chain
+│   └── visualize_graph.py              # Graph visualization utility
 ├── llm.yaml                             # LLM connection config (API key, model, etc.)
 └── setup.py
 ```
@@ -605,7 +619,7 @@ python scripts/run_pipeline.py \
 # pyrmdp pipeline configuration
 
 # ── Iterative convergence loop
-epsilon: 0.02               # Δ_cosine < ε → stop
+epsilon: 0.1                # Δ_Wasserstein < ε → stop
 max_loop_iterations: 10     # hard cap on outer loop
 max_recovery_per_iter: null # budget cap per iteration (null = unlimited)
 
@@ -613,13 +627,17 @@ max_recovery_per_iter: null # budget cap per iteration (null = unlimited)
 failure_prob: 0.1           # P(failure branch) per action
 
 # ── Step 2: Abstract State Pruning
-enable_mutex_pruning: false  # enable R5 LLM mutex pruning
+enable_mutex_pruning: true   # enable R5 LLM mutex pruning
 
 # ── Step 5: Delta Minimization (deterministic — no LLM)
 scoring_alpha: 0.7          # weight for delta similarity
 scoring_beta: 0.3           # weight for topological gain
 max_delta_iterations: 50    # max synthesis iterations per loop pass
 max_candidates_per_iter: 10
+delta_threshold: 15         # max predicate delta per synthesis prompt
+enable_llm_feasibility: true  # LLM physics-feasibility gate for bridge selection
+feasibility_k: 5            # top-k Hamming candidates for LLM gate
+feasibility_lambda: 0.5     # blending weight for LLM rank penalty
 
 # ── Step 6: Multi-Policy Emission
 num_robot_policies: 3
@@ -627,10 +645,14 @@ success_reward: 10.0
 unchanged_reward: -1.0
 failure_reward: -10.0
 human_reward: 0.0
+initial_success_prob: 0.3333
+initial_unchanged_prob: 0.3333
+initial_failure_prob: 0.3333
 
 # ── Output
 output_dir: ./pipeline_output
 save_intermediates: false
+visualize: true
 ```
 
 **`llm.yaml` example:**
@@ -653,17 +675,20 @@ max_retries: 2
 | `--image`, `-i` | — | RGB image path (repeatable for multiple views) |
 | `--task`, `-t` | — | NL task description (repeatable) |
 | `--domain`, `-d` | — | Existing PDDL file (skips Step 0) |
+| `--scene-description` | — | Optional extra scene description for the VLM (Step 0a) |
+| `--domain-name` | — | Suggested PDDL domain name (Step 0a) |
 | `--config`, `-c` | — | YAML config file; CLI flags override its values |
 | `--dump-config` | — | Write a default `pipeline.yaml` to `--output-dir` and exit |
 | `--output-dir`, `-o` | `./pipeline_output` | Directory for all outputs |
 | `--num-policies`, `-K` | `3` | Robot policy variants per action (Step 6) |
-| `--enable-mutex-pruning` | off | Enable R5 LLM-based mutex pruning (Step 2) |
+| `--enable-mutex-pruning` | on | Enable R5 LLM-based mutex pruning (Step 2) |
 | `--save-intermediates` | off | Save per-step JSON/GraphML files |
+| `--no-visualize` | off | Skip generating the interactive evolution.html visualization |
 | `--failure-prob` | `0.1` | Failure branch probability (Step 1) |
 | `--max-delta-iterations` | `50` | Max synthesis iterations — Step 5 (deterministic) |
 | `--scoring-alpha` | `0.7` | Delta similarity weight (Step 5) |
 | `--scoring-beta` | `0.3` | Topological gain weight (Step 5) |
-| `--epsilon` | `0.02` | Spectral-distance (cosine) convergence threshold |
+| `--epsilon` | `0.1` | Spectral-distance (Wasserstein) convergence threshold |
 | `--max-loop-iterations` | `10` | Maximum iterations for Steps 1–5 loop |
 | `--max-recovery-per-iter` | unlimited | Budget cap: max recovery operators per iteration |
 | `--success-reward` | `10.0` | Reward for success branch (Step 6) |

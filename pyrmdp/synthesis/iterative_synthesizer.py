@@ -9,14 +9,16 @@ repeatedly:
   4. Compute MSCA bound (sources / sinks)                  (Step 4)
   5. Synthesize recovery operators bridging sink→source     (Step 5)
 
-The loop terminates when the **cosine spectral distance** between
+The loop terminates when the **Wasserstein spectral distance** between
 consecutive transition-matrix eigenvalue spectra falls below ε:
 
-    Δ_cos  =  1 − cos(Λ_current, Λ_prev)  <  ε
+    Δ_W  =  W₁(Λ_current, Λ_prev)  <  ε
 
-Cosine distance is **dimension-invariant**: proportional growth of the
-abstract state-space (which adds eigenvalue-1 entries for new absorbing
-states) does not inflate the metric the way raw L₂ would.
+Wasserstein (Earth Mover's) distance is **dimension-invariant**: it
+treats sorted eigenvalue arrays as empirical distributions and computes
+the optimal transport cost, with no zero-padding needed.  It provides
+the tightest convergence signal — typically 1–2 orders of magnitude
+smaller than cosine distance.
 
 The ``max_recovery_per_iter`` budget cap (set via ``ScoringConfig``)
 limits how many recovery operators Step 5 can emit per outer-loop
@@ -313,7 +315,7 @@ class IterativeDomainSynthesizer:
         The pyPPDDL Domain object (from Step 0 or loaded from file).
         **Mutated in place** as new predicates/types/actions are added.
     epsilon : float
-        Convergence threshold for cosine spectral distance (default 0.02).
+        Convergence threshold for Wasserstein spectral distance (default 0.02).
     max_iterations : int
         Hard cap on loop iterations (default 10).
     failure_prob : float
