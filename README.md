@@ -40,7 +40,13 @@ On top of the FODD core, pyrmdp ships a **synthesis pipeline** that:
   - [5.3 CLI Reference](#53-cli-reference)
   - [5.4 Programmatic Usage](#54-programmatic-usage)
   - [5.5 FODD Visualization](#55-fodd-visualization)
-- [6. References](#6-references)
+- [6. Offline Validation: Trajectory Evaluation](#6-offline-validation-trajectory-evaluation)
+  - [6.1 Overview](#61-overview)
+  - [6.2 Pipeline Stages](#62-pipeline-stages)
+  - [6.3 Module Structure](#63-module-structure)
+  - [6.4 Usage](#64-usage)
+  - [6.5 Metrics](#65-metrics)
+- [7. References](#7-references)
 
 ---
 
@@ -154,10 +160,11 @@ For each operator in the domain, query the LLM to hallucinate a physically plaus
 | **Output** | Augmented `Domain` with probabilistic failure branches |
 
 **Algorithm:**
-1. For each `ActionSchema` in the domain:
+1. **Iteration 0 — Full sweep:** For each `ActionSchema` in the initial domain:
    - Serialize the action (parameters, precondition, effects, domain context) into a human-readable description
    - Query the LLM for a JSON response containing `failure_add`, `failure_del`, `failure_numeric`, `new_predicates`, `new_types`
-2. Parse the response and inject:
+2. **Subsequent iterations — Frontier-Only Policy:** Only query the LLM to hallucinate failures for **newly synthesized recovery operators** from the previous iteration. Previously processed operators are tracked via `known_action_names` and never re-queried. This prevents exponential state-space explosion and guarantees finite termination.
+3. Parse the response and inject:
    - New predicates/types into the domain (if any)
    - A failure-branch `Effect` with probability `failure_prob` (default 0.1)
    - Rescale existing effects to `(1 - failure_prob)`
@@ -207,10 +214,15 @@ When `--enable-mutex-pruning` is set, query the LLM for domain mutex constraints
 | **Prompt** | `prompts/llm_mutex_prompt.py` |
 | **Output** | Pruned `nx.DiGraph` (fewer nodes) |
 
-**Three kinds of constraints:**
+**Three kinds of pairwise constraints:**
 - **positive_mutex**: pred_a and pred_b cannot both be TRUE (e.g. `holding` ∧ `arm-empty`)
 - **negative_mutex**: pred_a and pred_b cannot both be FALSE (at least one must hold)
 - **implication**: If pred_a is TRUE then pred_b must be TRUE (e.g. `holding` → `graspable`)
+
+**Exactly-One Mutex Groups (SAS+):** In addition to pairwise rules, the LLM identifies groups of mutually exclusive *and* exhaustive predicates (e.g. `{opened, closed}`) via `ExactlyOneGroup`. These groups serve two purposes:
+
+1. **Operator auto-patching** (`patch_operator_effects()`): When an action adds predicate `P` belonging to group `G`, delete effects for all other group members are automatically injected (e.g. adding `opened(?c)` auto-injects `(not (closed ?c))`). This prevents physical simulator conflicts from state variable fragmentation.
+2. **Hamming distance correction** (`mutex_aware_hamming_distance()`): A transition from `opened` to `closed` within the same group is counted as distance **1** (atomic swap), not 2. Greedy pairing within groups ensures Step 5 bridge selection uses physically meaningful distances.
 
 **Algorithm:**
 1. Query the LLM with the domain's predicate names
@@ -457,10 +469,20 @@ pyrmdp/
 │   │   ├── delta_minimizer.py           # Step 5 — deterministic recovery synthesis (no LLM)
 │   │   ├── iterative_synthesizer.py     # Iterative loop (Steps 1–5) w/ spectral convergence
 │   │   └── ppddl_emitter.py            # Step 6 — multi-policy PPDDL emission
+│   ├── offline_validate/
+│   │   ├── __init__.py
+│   │   ├── vlm_state_estimator.py       # Multi-view VLM state estimation
+│   │   ├── mutex_filter.py              # Mutex-bounded temporal smoothing
+│   │   ├── trajectory_lifter.py         # Existential abstraction (∃-lifting)
+│   │   ├── graph_evaluator.py           # Abstract graph recall metrics
+│   │   └── robomind/
+│   │       ├── __init__.py
+│   │       └── hdf5_loader.py           # RoboMIND HDF5 multi-camera loader
 │   └── vis/
 │       └── visualization.py             # pyvis interactive FODD/graph plotting
 ├── scripts/
 │   ├── run_pipeline.py                  # End-to-end pipeline (Steps 0–6) CLI
+│   ├── evaluate_video_trajectories.py   # Offline trajectory evaluation CLI (§6)
 │   ├── run_all_testdata.py              # Batch runner — all test cases in parallel
 │   ├── run_experiment1_convergence.py   # Experiment 1 — spectral convergence budget sweep
 │   ├── visualize_evolution.py           # Interactive HTML evolution graph (vis.js)
@@ -800,7 +822,154 @@ transitions, recovery operators, and provenance traces.
 
 ---
 
-## 6. References
+## 6. Offline Validation: Trajectory Evaluation
+
+### 6.1 Overview
+
+pyrmdp includes an **offline validation pipeline** that evaluates empirical robot trajectories against synthesized abstract graphs. Given an HDF5 trajectory (e.g. from the RoboMIND dataset), it:
+
+1. Extracts subsampled video frames from **all available cameras**,
+2. Queries a VLM to estimate per-frame logical predicate states (multi-view fusion),
+3. Filters noise via mutex-bounded temporal smoothing,
+4. Lifts grounded predicates to abstract signatures via existential quantification (∃),
+5. Computes recall metrics against the abstract transition graph.
+
+The abstract graph can be pre-built (`--pipeline-dir`) or **auto-synthesized** from the trajectory's first frame and task description.
+
+### 6.2 Pipeline Stages
+
+```
+HDF5 Trajectory (all cameras)
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│  1. Frame Extraction & Subsampling      │  load_trajectory_multicam()
+│     (front + left + right + wrist)      │
+└────────────────┬────────────────────────┘
+                 │
+                 ▼
+┌─────────────────────────────────────────┐
+│  2. VLM Grounding Bootstrap             │  discover_grounding()
+│     (all camera views of frame 0        │  → grounded predicates
+│      + PDDL predicate signatures)       │
+└────────────────┬────────────────────────┘
+                 │
+                 ▼
+┌─────────────────────────────────────────┐
+│  3. Per-Frame State Estimation          │  estimate_trajectory()
+│     (multi-view VLM queries, parallel)  │  → List[Dict[str, bool]]
+└────────────────┬────────────────────────┘
+                 │
+                 ▼
+┌─────────────────────────────────────────┐
+│  4. Mutex Filter & Collapse             │  filter_and_collapse()
+│     (drop in-transit frames,            │  → discrete keyframes
+│      collapse identical states)         │
+└────────────────┬────────────────────────┘
+                 │
+                 ▼
+┌─────────────────────────────────────────┐
+│  5. Existential Lifting                 │  lift_trajectory()
+│     ∃x P(x) = True ⟺ any P(a) True    │  → List[(frozenset, frozenset)]
+│     ¬∃x P(x) = True ⟺ all P(a) False  │
+└────────────────┬────────────────────────┘
+                 │
+                 ▼
+┌─────────────────────────────────────────┐
+│  6. Graph Evaluation                    │  evaluate()
+│     (belief-state subset matching,      │  → State Recall, Path Recall,
+│      reachability-based path recall)    │    Super-Coverage
+└─────────────────────────────────────────┘
+```
+
+### 6.3 Module Structure
+
+```
+pyrmdp/offline_validate/
+├── __init__.py
+├── vlm_state_estimator.py    # VLM callable builder + multi-view state estimation
+├── mutex_filter.py           # Mutex-bounded temporal smoothing
+├── trajectory_lifter.py      # Existential abstraction (grounded → lifted)
+├── graph_evaluator.py        # Abstract graph loading + recall metrics
+└── robomind/                 # ── Dataset-specific loaders ──
+    ├── __init__.py
+    └── hdf5_loader.py        # RoboMIND HDF5 trajectory loading (multi-camera)
+```
+
+The four generic modules (`vlm_state_estimator`, `mutex_filter`, `trajectory_lifter`, `graph_evaluator`) are dataset-agnostic. Adding support for a new dataset (e.g. DROID, BridgeData) only requires a new loader under its own subfolder.
+
+### 6.4 Usage
+
+**Auto-synthesize abstract graph from the trajectory (default — all cameras):**
+
+```bash
+python scripts/evaluate_video_trajectories.py \
+    --trajectory pyrmdp/test_failure_data/trajectory.hdf5 \
+    --target-fps 2 --source-fps 10 \
+    --max-workers 4 \
+    --output evaluation_results.json -v
+```
+
+**Use a pre-built pipeline directory:**
+
+```bash
+python scripts/evaluate_video_trajectories.py \
+    --pipeline-dir pyrmdp/test_data/7/output_batch \
+    --trajectory pyrmdp/test_failure_data/trajectory.hdf5 \
+    --target-fps 2 --source-fps 10 \
+    --max-workers 4 \
+    --output evaluation_results.json -v
+```
+
+**Select specific cameras:**
+
+```bash
+python scripts/evaluate_video_trajectories.py \
+    --trajectory pyrmdp/test_failure_data/trajectory.hdf5 \
+    --cameras camera_front camera_wrist \
+    --target-fps 2 --source-fps 10 \
+    --output evaluation_results.json -v
+```
+
+**Save annotated frames (predicate states overlaid in existential quantifier notation):**
+
+```bash
+python scripts/evaluate_video_trajectories.py \
+    --trajectory pyrmdp/test_failure_data/trajectory.hdf5 \
+    --frame-output-dir ./annotated_frames \
+    --target-fps 2 --source-fps 10 \
+    --output evaluation_results.json -v
+```
+
+**CLI Reference:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--trajectory`, `-t` | — | HDF5 trajectory file or directory of HDF5 files |
+| `--pipeline-dir`, `-p` | — | Pre-built pipeline output directory (auto-synthesized if omitted) |
+| `--synthesis-output-dir` | `./pipeline_output` | Where to store auto-synthesized pipeline output |
+| `--cameras` | all | Camera keys to use (default: all cameras in the HDF5 file) |
+| `--target-fps` | `2.0` | Target frame extraction rate (Hz) |
+| `--source-fps` | `10.0` | Native recording rate of the trajectory (Hz) |
+| `--embodiment` | — | Embodiment tag for BGR→RGB correction |
+| `--max-workers` | `4` | Max parallel VLM workers |
+| `--frame-output-dir` | — | Directory to save annotated frame PNGs |
+| `--output`, `-o` | `evaluation_results.json` | Output JSON path |
+| `-v` | off | Verbose (DEBUG) logging |
+
+### 6.5 Metrics
+
+| Metric | Definition | Interpretation |
+|--------|-----------|----------------|
+| **State Recall** | Fraction of empirical keyframes whose belief state (set of compatible graph nodes) is non-empty | How well the abstract graph covers observed states |
+| **Path Recall** | Fraction of consecutive keyframe pairs where some `(u, v)` across their belief states is reachable in the graph | How well the graph covers observed transitions |
+| **Super-Coverage** | `|graph nodes| / |unique empirical states|` | Ratio of abstract graph expressiveness to empirical diversity |
+
+**Belief-state matching** uses subset semantics: an empirical observation is a partial view, and a graph node matches if the observed true predicates are a subset of the node's true set and observed false predicates are a subset of the node's false set (restricted to the node's vocabulary).
+
+---
+
+## 7. References
 
 1.  **Boutilier, C., Reiter, R., & Price, B. (2001).** Symbolic dynamic programming for first-order MDPs. *IJCAI*, 1, 690-700.
 2.  **Wang, C., Joshi, S., & Khardon, R. (2008).** First order decision diagrams for relational MDPs. *Journal of Artificial Intelligence Research*, 31, 431-472.

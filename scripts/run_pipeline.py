@@ -201,6 +201,7 @@ def run_pipeline(
     # ────────────────────────────────────────────────────────────────
     # Step 0: Domain Genesis (VLM + LLM)  — or load from file
     # ────────────────────────────────────────────────────────────────
+    result = None  # GenesisResult, populated when Step 0 runs
     if domain_path:
         logger.info("═" * 60)
         logger.info("Skipping Step 0 — loading domain from file")
@@ -328,6 +329,12 @@ def run_pipeline(
     # ────────────────────────────────────────────────────────────────
     # Steps 1–5 (iterative loop) + Step 6 (emission)
     # ────────────────────────────────────────────────────────────────
+    mutex_groups = []
+    mutex_pairwise_rules = []
+    if isinstance(result, GenesisResult):
+        mutex_groups = getattr(result, "mutex_groups", None) or []
+        mutex_pairwise_rules = getattr(result, "mutex_pairwise_rules", None) or []
+
     synth = IterativeDomainSynthesizer(
         domain,
         epsilon=cfg.epsilon,
@@ -338,6 +345,9 @@ def run_pipeline(
         output_dir=str(out),
         save_intermediates=cfg.save_intermediates,
         enable_mutex_pruning=cfg.enable_mutex_pruning,
+        mutex_groups=mutex_groups,
+        mutex_pairwise_rules=mutex_pairwise_rules,
+        image_paths=[Path(p) for p in image_paths] if image_paths else None,
     )
 
     ppddl_output = synth.run()

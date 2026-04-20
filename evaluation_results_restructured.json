@@ -1,0 +1,58 @@
+{
+  "num_trajectories": 1,
+  "mean_state_recall": 1.0,
+  "mean_path_recall": 0.75,
+  "mean_super_coverage": 2.2857142857142856,
+  "per_trajectory": [
+    {
+      "trajectory": "pyrmdp/test_failure_data/trajectory.hdf5",
+      "language_instruction": "Put the white toy into the drawer.",
+      "cameras": [
+        "camera_front",
+        "camera_left",
+        "camera_right",
+        "camera_wrist"
+      ],
+      "total_frames": 86,
+      "sampled_frames": 18,
+      "valid_frames": 9,
+      "keyframes": 9,
+      "grounded_predicates": [
+        "open(drawer)",
+        "closed(drawer)",
+        "graspable(white_toy)",
+        "on(white_toy, drawer)",
+        "in(white_toy, drawer)",
+        "holding(robot, white_toy)",
+        "on-surface(white_toy, table)",
+        "reachable(robot, white_toy)",
+        "reachable(robot, drawer)",
+        "arm-empty(robot)",
+        "clear(white_toy)",
+        "clear(drawer)"
+      ],
+      "state_recall": 1.0,
+      "path_recall": 0.75,
+      "super_coverage": 2.2857142857142856,
+      "matched_keyframes": 9,
+      "total_keyframes": 9,
+      "matched_transitions": 6,
+      "total_transitions": 8,
+      "unique_empirical_states": 7,
+      "total_graph_nodes": 16,
+      "belief_state_sizes": [
+        2,
+        2,
+        4,
+        2,
+        4,
+        6,
+        4,
+        3,
+        3
+      ],
+      "unmatched_states": [],
+      "elapsed_s": 36.063047885894775
+    }
+  ]
+}

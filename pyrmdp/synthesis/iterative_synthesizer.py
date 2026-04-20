@@ -355,6 +355,7 @@ class IterativeDomainSynthesizer:
         enable_mutex_pruning: bool = False,
         mutex_groups: Optional[List] = None,
         mutex_pairwise_rules: Optional[List] = None,
+        image_paths: Optional[List] = None,
     ) -> None:
         self.domain = domain
         self.epsilon = epsilon
@@ -366,6 +367,7 @@ class IterativeDomainSynthesizer:
         self.output_dir = Path(output_dir)
         self.save_intermediates = save_intermediates
         self.enable_mutex_pruning = enable_mutex_pruning
+        self.image_paths = image_paths or []
 
         # ── Mutex groups (SAS+ exactly-one) ──
         self._mutex_groups: List = list(mutex_groups or [])
@@ -574,6 +576,7 @@ class IterativeDomainSynthesizer:
                             groups, pw_rules = generate_mutex_groups(
                                 pred_sigs,
                                 llm_fn=self.llm_fn,
+                                image_paths=self.image_paths or None,
                                 valid_predicate_names=current_preds,
                             )
                             self._mutex_groups = groups
@@ -628,7 +631,9 @@ class IterativeDomainSynthesizer:
                 )
                 pred_names = [p.name for p in self.domain.predicates]
                 mutex_rules = generate_mutex_rules(
-                    pred_names, llm_fn=self.llm_fn,
+                    pred_names,
+                    llm_fn=self.llm_fn,
+                    image_paths=self.image_paths or None,
                 )
                 mutex_result = prune_with_mutexes(abstract_graph, mutex_rules)
                 logger.info(

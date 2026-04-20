@@ -45,7 +45,8 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, FrozenSet, List, Optional, Set, Tuple
+from pathlib import Path
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Set, Tuple, Union
 
 import networkx as nx
 
@@ -259,6 +260,8 @@ def generate_mutex_rules(
     predicate_names: List[str],
     *,
     llm_fn: Optional[Callable[[str], str]] = None,
+    vlm_fn: Optional[Callable] = None,
+    image_paths: Optional[List[Union[str, Path]]] = None,
 ) -> List[MutexRule]:
     """
     Query an LLM for domain mutex constraints on the given predicates.
@@ -270,25 +273,51 @@ def generate_mutex_rules(
     llm_fn : callable, optional
         ``fn(prompt) → response_text``.  If *None*, builds one from
         ``llm.yaml`` via :func:`synthesis.llm_config.build_llm_fn`.
+    vlm_fn : callable, optional
+        ``fn(system, user_text, images) → response_text``.  Used when
+        *image_paths* is provided.  If *None* and images are given,
+        builds one from ``domain_genesis._build_default_vlm_fn``.
+    image_paths : list[str | Path], optional
+        Scene images to ground the mutex generation via VLM.
 
     Returns
     -------
     list[MutexRule]
         Validated mutex rules referencing only known predicates.
     """
-    if llm_fn is None:
-        try:
-            from pyrmdp.synthesis.llm_config import build_llm_fn
-            llm_fn = build_llm_fn()
-        except (EnvironmentError, ImportError) as exc:
-            logger.warning("LLM unavailable (%s) — returning empty rules.", exc)
-            return []
-
-    pred_list_str = "\n".join(f"  - {p}" for p in sorted(predicate_names))
-    prompt = _build_mutex_prompt_str(predicate_names)
+    use_vlm = bool(image_paths)
 
     logger.info("Generating mutex rules for %d predicates …", len(predicate_names))
-    response = llm_fn(prompt)
+
+    if use_vlm:
+        from pyrmdp.synthesis.domain_genesis import (
+            _load_image_as_base64,
+            _image_mime,
+            _build_default_vlm_fn,
+        )
+
+        if vlm_fn is None:
+            vlm_fn = _build_default_vlm_fn()
+
+        parts = build_mutex_prompt(predicate_names, use_vlm=True)
+        images = [
+            {"mime": _image_mime(p), "base64": _load_image_as_base64(p)}
+            for p in image_paths
+        ]
+        logger.info("  VLM mutex: sending %d image(s)", len(images))
+        response = vlm_fn(parts["system"], parts["user"], images)
+    else:
+        if llm_fn is None:
+            try:
+                from pyrmdp.synthesis.llm_config import build_llm_fn
+                llm_fn = build_llm_fn()
+            except (EnvironmentError, ImportError) as exc:
+                logger.warning("LLM unavailable (%s) — returning empty rules.", exc)
+                return []
+
+        prompt = _build_mutex_prompt_str(predicate_names)
+        response = llm_fn(prompt)
+
     logger.debug("Mutex LLM response:\n%s", response)
 
     valid_preds = set(predicate_names)
@@ -308,6 +337,8 @@ def generate_mutex_groups(
     predicate_signatures: List[str],
     *,
     llm_fn: Optional[Callable[[str], str]] = None,
+    vlm_fn: Optional[Callable] = None,
+    image_paths: Optional[List[Union[str, Path]]] = None,
     valid_predicate_names: Optional[Set[str]] = None,
 ) -> Tuple[List[ExactlyOneGroup], List[MutexRule]]:
     """
@@ -320,6 +351,11 @@ def generate_mutex_groups(
         "holding ?a ?o", "arm-empty ?a"]``.
     llm_fn : callable, optional
         ``fn(prompt) → response_text``.
+    vlm_fn : callable, optional
+        ``fn(system, user_text, images) → response_text``.  Used when
+        *image_paths* is provided.
+    image_paths : list[str | Path], optional
+        Scene images to ground the mutex generation via VLM.
     valid_predicate_names : set[str], optional
         Bare predicate names for validation.  If *None*, extracted from
         *predicate_signatures*.
@@ -330,25 +366,46 @@ def generate_mutex_groups(
     pairwise_rules : list[MutexRule]
         Both ``positive_mutex`` and ``negative_mutex`` for every pair.
     """
-    if llm_fn is None:
-        try:
-            from pyrmdp.synthesis.llm_config import build_llm_fn
-            llm_fn = build_llm_fn()
-        except (EnvironmentError, ImportError) as exc:
-            logger.warning("LLM unavailable (%s) — returning empty groups.", exc)
-            return [], []
+    use_vlm = bool(image_paths)
 
     if valid_predicate_names is None:
         valid_predicate_names = {sig.split()[0] for sig in predicate_signatures}
-
-    parts = build_mutex_group_prompt(predicate_signatures)
-    prompt = parts["system"] + "\n\n" + parts["user"]
 
     logger.info(
         "Generating mutex groups for %d predicates …",
         len(predicate_signatures),
     )
-    response = llm_fn(prompt)
+
+    if use_vlm:
+        from pyrmdp.synthesis.domain_genesis import (
+            _load_image_as_base64,
+            _image_mime,
+            _build_default_vlm_fn,
+        )
+
+        if vlm_fn is None:
+            vlm_fn = _build_default_vlm_fn()
+
+        parts = build_mutex_group_prompt(predicate_signatures, use_vlm=True)
+        images = [
+            {"mime": _image_mime(p), "base64": _load_image_as_base64(p)}
+            for p in image_paths
+        ]
+        logger.info("  VLM mutex groups: sending %d image(s)", len(images))
+        response = vlm_fn(parts["system"], parts["user"], images)
+    else:
+        if llm_fn is None:
+            try:
+                from pyrmdp.synthesis.llm_config import build_llm_fn
+                llm_fn = build_llm_fn()
+            except (EnvironmentError, ImportError) as exc:
+                logger.warning("LLM unavailable (%s) — returning empty groups.", exc)
+                return [], []
+
+        parts = build_mutex_group_prompt(predicate_signatures)
+        prompt = parts["system"] + "\n\n" + parts["user"]
+        response = llm_fn(prompt)
+
     logger.debug("Mutex-group LLM response:\n%s", response)
 
     groups, pairwise_rules = _parse_mutex_group_response(

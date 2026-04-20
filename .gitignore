@@ -88,3 +88,5 @@ outputs/
 experiments/
 figures/
 docs/
+pyrmdp/test_failure_data
+pipeline_output/
