@@ -1,0 +1,68 @@
+{
+  "scene_01.jpg": [
+    {
+      "task_name": "close the box",
+      "steps": ""
+    },
+    {
+      "task_name": "pick up the marker and put it into another cup",
+      "steps": ""
+    },
+    {
+      "task_name": "stack the cups",
+      "steps": ""
+    }
+  ],
+  "scene_02.jpg": [
+    {
+      "task_name": "stack the blocks",
+      "steps": ""
+    },
+    {
+      "task_name": "close the box",
+      "steps": ""
+    }
+  ],
+  "scene_03.jpg": [
+    {
+      "task_name": "close the box",
+      "steps": ""
+    }
+  ],
+  "scene_04.jpg": [
+    {
+      "task_name": "put the blocks into the box",
+      "steps": ""
+    }
+  ],
+  "scene_05.jpg": [
+    {
+      "task_name": "pour some water into the cup",
+      "steps": ""
+    }
+  ],
+  "scene_06.jpg": [
+    {
+      "task_name": "stack the blocks",
+      "steps": ""
+    }
+  ],
+  "scene_07.jpg": [
+    {
+      "task_name": "pick up the marker and pour some water into the cup",
+      "steps": ""
+    }
+  ],
+  "scene_08.jpg": [
+    {
+      "task_name": "pick up the marker and put it into the box",
+      "steps": ""
+    }
+  ],
+  "scene_09.jpg": [
+    {
+      "task_name": "scoop the blocks and put it into cup",
+      "steps": ""
+    }
+  ]
+}
