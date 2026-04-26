@@ -46,7 +46,12 @@ On top of the FODD core, pyrmdp ships a **synthesis pipeline** that:
   - [6.3 Module Structure](#63-module-structure)
   - [6.4 Usage](#64-usage)
   - [6.5 Metrics](#65-metrics)
-- [7. References](#7-references)
+- [7. Online Update Experiment (Human-in-the-Loop)](#7-online-update-experiment-human-in-the-loop)
+  - [7.1 What It Is](#71-what-it-is)
+  - [7.2 Architecture](#72-architecture)
+  - [7.3 Failure Categories](#73-failure-categories)
+  - [7.4 Quick Start](#74-quick-start)
+- [8. References](#8-references)
 
 ---
 
@@ -969,7 +974,97 @@ python scripts/evaluate_video_trajectories.py \
 
 ---
 
-## 7. References
+## 7. Online Update Experiment (Human-in-the-Loop)
+
+A companion **FastAPI + Streamlit** app under
+[pyrmdp/online_experiment/](pyrmdp/online_experiment/README.md)
+turns the offline pipeline into an interactive *Turing test* for the
+robustification algorithm itself. See the folder README for full details;
+a brief summary follows.
+
+### 7.1 What It Is
+
+Two humans drive the system on the same WiFi:
+
+- **H1 (teleoperator)** — plays a noisy robot policy. For each abstract
+  action suggested by the backend, reports *Success*, *Unchanged*, or
+  *Failure*. Failures are tagged with one of five categories (kinematic
+  impossibility, known trap, expert-composed new abstract state, missing
+  predicate with typed parameters, or free-text / photo).
+- **H2 (baseline)** — manually enumerates recovery skills they think a
+  human programmer would add, to be compared against the MSCA-synthesised
+  operator set.
+
+The PC backend maintains the live abstract transition graph, per-operator
+Dirichlet posteriors with Beta-LCB severing
+($\mathrm{LCB}(P_{\text{succ}}) < \varepsilon_\text{phys}$ ⇒ Tabu), a
+Wasserstein spectral-convergence monitor
+$\Delta_W = W_1(\Lambda_\text{curr}, \Lambda_\text{prev})$, and a MSCA
+**re-synthesis reflex** that fires whenever topology changes and
+$\Delta_W > \varepsilon_\text{spectral}$.
+
+### 7.2 Architecture
+
+```
+Laptop / Phone  ─── REST/JSON ───►  PC (FastAPI + pyrmdp)
+  Streamlit (port 8501, 4 tabs)        GraphManager · Dirichlet · Tabu
+    • H1 teleop / expert diagnostics   OnlineUpdater (5 failure routes)
+    • H2 baseline skill log            MSCA re-synthesis (delta_minimize)
+    • Δ_W / nodes / tabu dashboard
+    • Live vis.js graph (policy-coloured, dashed = severed, red = trap)
+```
+
+Updated project tree (online additions only):
+
+```
+pyrmdp/
+└── pyrmdp/
+    └── online_experiment/
+        ├── README.md              detailed design + REST contract
+        ├── run_backend.sh         uvicorn on 0.0.0.0:8000
+        ├── run_frontend.sh        streamlit on 0.0.0.0:8501
+        ├── backend/
+        │   ├── state_manager.py   GraphManager / DirichletCounts / TabuEntry
+        │   ├── online_updater.py  5 failure routes + MSCA reflex
+        │   └── server.py          FastAPI (10 endpoints)
+        └── frontend/
+            └── app.py             Streamlit 4-tab UI + vis.js embed
+```
+
+### 7.3 Failure Categories
+
+| UI label | `failure_type` | Backend effect |
+|---|---|---|
+| 🚫 Kinematic Impossibility | `kinematic` | Force LCB=0, sever every edge of the op |
+| 📍 Known Trap State | `known_state` | $n_{\text{fail}}\!\uparrow$; sever if LCB < ε_phys |
+| 🧩 Compose from existing predicates | `new_state_from_existing` | Build `AbstractState(T,F)` → attach as trap |
+| ✨ Missing predicate (expert-typed) | `new_predicate` | Append `Predicate(name,params)` to domain, rebuild graph |
+| 📝 Free-text / photo | `new_state` | Parse predicates → add trap node |
+
+After any topology change the backend recomputes Δ_W and runs MSCA until
+irreducible — the same algorithm and guarantees as the offline pipeline.
+
+### 7.4 Quick Start
+
+```bash
+# PC
+export PYRMDP_DOMAIN_PATH=./pipeline_output/robustified.ppddl
+./pyrmdp/online_experiment/run_backend.sh             # → :8000
+
+# Laptop (same WiFi)
+export PYRMDP_BACKEND_URL=http://<PC-IP>:8000
+./pyrmdp/online_experiment/run_frontend.sh            # → :8501
+
+# Phone → http://<laptop-IP>:8501
+```
+
+See [pyrmdp/online_experiment/README.md](pyrmdp/online_experiment/README.md)
+for the full REST contract, payload schemas, graph-legend colour table,
+environment variables, validation curl recipes, and troubleshooting notes.
+
+---
+
+## 8. References
 
 1.  **Boutilier, C., Reiter, R., & Price, B. (2001).** Symbolic dynamic programming for first-order MDPs. *IJCAI*, 1, 690-700.
 2.  **Wang, C., Joshi, S., & Khardon, R. (2008).** First order decision diagrams for relational MDPs. *Journal of Artificial Intelligence Research*, 31, 431-472.
